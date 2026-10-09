@@ -1316,7 +1316,8 @@ static bool fib_app_custom_event(void* context, uint32_t event) {
             snprintf(app->currency_prompt, sizeof(app->currency_prompt), "%s Amount",
                      toolbox_currency_code(app->converter.currency[side]));
             const char* amount = app->converter.amount[side];
-            snprintf(app->input_buffer, TOOLBOX_AMOUNT_SIZE, "%s",
+            snprintf(app->input_buffer, TOOLBOX_AMOUNT_SIZE, "%.*s",
+                     (int)(TOOLBOX_AMOUNT_SIZE - 1U),
                      toolbox_valid_amount(amount) ? amount : "");
             text_input_set_header_text(app->url_input, app->currency_prompt);
             text_input_set_minimum_length(app->url_input, 1U);

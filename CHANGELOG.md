@@ -1,5 +1,8 @@
 ## v0.5.0 (2026-10-09)
 
+- Keep currency amount-editor copies explicitly bounded for newer compilers.
+  Desktop packaging CI uses an editable checkout so the source package does not
+  hide the installed radio decoder; Windows/Linux jobs run independently.
 - Completed the reusable source SDK with explicit USB/Bluetooth connection,
   nonce-bound computer approval, code/status polling and recognition revocation.
   Added a ready-made connection screen and dependency-free one-command export.

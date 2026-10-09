@@ -18,6 +18,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -30,7 +31,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install ".[desktop]" pyinstaller
+      # Tests/PyInstaller import the checkout: keep its compiled decoder there,
+      # instead of shadowing an installed wheel with an extension-free source tree.
+      - run: python -m pip install -e ".[desktop]" pyinstaller
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0
       - name: Verify radio decoder is present in release binaries
