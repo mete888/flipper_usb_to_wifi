@@ -24,7 +24,7 @@ The Flipper app sends bounded requests over USB CDC or Bluetooth GATT. A desktop
 
 - Flipper Zero with a microSD card
 - macOS 13 or later, Windows 10/11, or a current Linux distribution
-- A companion desktop host from the [project repository](https://github.com/mete888/flipper_usb_to_wifi)
+- A companion desktop host from the [project repository](https://github.com/mete888/flipper_internet_bridge)
 - A data-capable USB cable for USB mode, or compatible Bluetooth support for wireless mode
 
 The helper does not require administrator access. USB access requires **Allow Once** or **Always Allow**. Bluetooth requires selecting a bridge computer, code-based recognition for new peers and a separate **Allow Once** / **Deny** decision for each connection. Pairing alone does not grant internet access.

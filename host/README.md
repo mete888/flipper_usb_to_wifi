@@ -168,7 +168,7 @@ while retaining the original hostname for SNI and certificate validation.
 The `host-binaries.yml` workflow builds the CLI plus a **onedir** Qt GUI on each
 target OS. Keep the GUI's shared libraries and notices next to its executable;
 do not copy only the executable. Existing release candidates are on the
-[GitHub Releases](https://github.com/mete888/flipper_usb_to_wifi/releases) page.
+[GitHub Releases](https://github.com/mete888/flipper_internet_bridge/releases) page.
 This working-tree GUI change has not been published there.
 
 Windows PowerShell:

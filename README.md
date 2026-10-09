@@ -287,8 +287,8 @@ The GitHub repository already contains the application at its root; no nested
 project directories are needed:
 
 ```sh
-git clone https://github.com/mete888/flipper_usb_to_wifi.git
-cd flipper_usb_to_wifi
+git clone https://github.com/mete888/flipper_internet_bridge.git
+cd flipper_internet_bridge
 python3 -m venv .ufbt-venv
 ./.ufbt-venv/bin/python -m pip install --upgrade ufbt
 ./.ufbt-venv/bin/ufbt update --channel release
