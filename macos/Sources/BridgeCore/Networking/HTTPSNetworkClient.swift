@@ -7,6 +7,8 @@ public struct BridgeHTTPRequest: Equatable, Sendable {
     public let headers: [BridgeHTTPHeader]
     public let body: Data
     public let timeout: TimeInterval
+    public let bluetooth: Bool
+    public let maximumResponseBytes: Int
 
     public init(
         requestID: UInt32,
@@ -14,7 +16,9 @@ public struct BridgeHTTPRequest: Equatable, Sendable {
         urlString: String,
         headers: [BridgeHTTPHeader],
         body: Data,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        bluetooth: Bool = false,
+        maximumResponseBytes: Int = BridgeConfiguration.maximumResponseBytes
     ) {
         self.requestID = requestID
         self.method = method
@@ -22,6 +26,13 @@ public struct BridgeHTTPRequest: Equatable, Sendable {
         self.headers = headers
         self.body = body
         self.timeout = timeout
+        self.bluetooth = bluetooth
+        let pcm = !bluetooth && headers.contains {
+            $0.name.lowercased() == "accept" && $0.value.lowercased() == "audio/mpeg; fib-pcm=14493"
+        }
+        let limit = bluetooth ? BridgeConfiguration.bluetoothTextResponseBytes :
+            pcm ? BridgeConfiguration.maximumRadioResponseBytes : BridgeConfiguration.maximumResponseBytes
+        self.maximumResponseBytes = max(1, min(maximumResponseBytes, limit))
     }
 }
 
@@ -110,13 +121,20 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
         var deadlineWorkItem: DispatchWorkItem?
         let transformsNationalToday: Bool
         let transformsRadioBrowser: Bool
+        let toolboxKind: ToolboxExtractor.Kind?
         let expectsRadioAudio: Bool
+        let expectsRadioPCM: Bool
+        var pcmDecoder: RadioPCMDecoder?
+        var radioSourceBytes = 0
+        var radioSourceEnded = false
+        var radioSourcePaused = false
         var bufferedHTML = Data()
         var delayedResponse: BridgeHTTPResponseMetadata?
         var streamsRadioAudio = false
         var radioBuffer = Data()
         var radioReadOffset = 0
         var radioTimer: DispatchSourceTimer?
+        let radioDrainGate = DispatchSemaphore(value: 1)
 
         init(
             request: BridgeHTTPRequest,
@@ -128,6 +146,7 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
             self.onResponse = onResponse
             self.onData = onData
             self.completion = completion
+            toolboxKind = ToolboxExtractor.kind(for: request)
             transformsNationalToday = NationalTodayExtractor.handles(request)
             transformsRadioBrowser = RadioBrowserExtractor.handles(request)
             expectsRadioAudio = request.headers.contains { header in
@@ -135,6 +154,9 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
                     && header.value.lowercased().contains("audio/mpeg")
             }
             deadline = .now() + max(0.001, min(request.timeout, 30))
+            expectsRadioPCM = request.headers.contains {
+                $0.name.lowercased() == "accept" && $0.value.lowercased() == "audio/mpeg; fib-pcm=14493"
+            }
         }
     }
 
@@ -191,6 +213,10 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
             }
             if let previous = self.active { self.cancel(previous) }
             self.active = context
+            if request.bluetooth && context.expectsRadioAudio {
+                self.finish(context, result: .failure(.invalidResponse))
+                return
+            }
             self.scheduleDeadline(for: context)
             self.resolveAndStart(context)
         }
@@ -261,7 +287,8 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
         request.httpShouldHandleCookies = false
         request.cachePolicy = .reloadIgnoringLocalCacheData
         for header in policy.allowedRequestHeaders(context.request.headers) {
-            request.setValue(header.value, forHTTPHeaderField: header.name)
+            let value = context.expectsRadioPCM && header.name.lowercased() == "accept" ? "audio/mpeg" : header.value
+            request.setValue(value, forHTTPHeaderField: header.name)
         }
         request.setValue(BridgeConfiguration.fixedUserAgent, forHTTPHeaderField: "User-Agent")
         if context.request.method == .post { request.httpBody = context.request.body }
@@ -296,6 +323,7 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
         context.finished = true
         context.radioTimer?.cancel()
         context.radioTimer = nil
+        context.pcmDecoder = nil
         context.deadlineWorkItem?.cancel()
         context.deadlineWorkItem = nil
         if let task = context.task { contextsByTaskID.removeValue(forKey: task.taskIdentifier) }
@@ -304,28 +332,48 @@ public final class HTTPSNetworkClient: NSObject, BridgeHTTPClient {
     }
 
     private func startRadioDrainIfReady(_ context: Context) {
-        let targetBytes = 80 * 1_024 // About ten seconds at 64 kbit/s MP3.
+        let targetBytes = context.expectsRadioPCM ? 14493 * 2 * 10 : 80 * 1_024
         guard context.streamsRadioAudio, context.radioTimer == nil,
-              context.radioBuffer.count - context.radioReadOffset >= targetBytes else { return }
+              (context.radioBuffer.count - context.radioReadOffset >= targetBytes ||
+               context.radioSourceEnded) else { return }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
         // Smaller, more frequent deliveries keep CDC traffic even instead of
         // producing a six-frame burst every 128 ms. The average remains the
-        // exact 8 kB/s required by a 64 kbit/s MP3 stream.
-        timer.schedule(deadline: .now(), repeating: .milliseconds(64), leeway: .milliseconds(4))
+        // exact 8 kB/s required by a 64 kbit/s MP3 stream (legacy clients).
+        // PCM gets scheduling headroom above 28,986 B/s. Device backpressure
+        // regulates the actual rate while keeping its original reservoir full.
+        timer.schedule(deadline: .now(), repeating: .milliseconds(context.expectsRadioPCM ? 16 : 64),
+                       leeway: .milliseconds(1))
         timer.setEventHandler { [weak self, weak context] in
             guard let self, let context else { return }
+            let gate = context.radioDrainGate
+            guard gate.wait(timeout: .now()) == .success else { return }
             self.delegateQueue.addOperation { [weak self, weak context] in
+                defer { gate.signal() }
                 guard let self, let context, !context.finished,
                       self.active?.token == context.token else { return }
                 let available = context.radioBuffer.count - context.radioReadOffset
-                guard available >= 512 else { return }
+                if available == 0 && context.radioSourceEnded {
+                    self.finish(context, result: .success(()))
+                    return
+                }
+                let quantum = 512
+                // 32 kB/s leaves room for delayed timer events. CDC endpoint
+                // backpressure and bounded synchronous writes prevent overflow.
+                guard available >= quantum || context.radioSourceEnded else { return }
+                let count = min(available, quantum)
                 let start = context.radioBuffer.index(
                     context.radioBuffer.startIndex,
                     offsetBy: context.radioReadOffset
                 )
-                let end = context.radioBuffer.index(start, offsetBy: 512)
+                let end = context.radioBuffer.index(start, offsetBy: count)
                 context.onData(context.radioBuffer.subdata(in: start..<end))
-                context.radioReadOffset += 512
+                context.radioReadOffset += count
+                if context.radioSourcePaused &&
+                    context.radioBuffer.count - context.radioReadOffset <= 289_860 {
+                    context.radioSourcePaused = false
+                    context.task?.resume()
+                }
                 if context.radioReadOffset >= 32 * 1_024 {
                     context.radioBuffer.removeFirst(context.radioReadOffset)
                     context.radioReadOffset = 0
@@ -353,10 +401,10 @@ extension HTTPSNetworkClient: URLSessionDataDelegate {
             }
             return
         }
-        let expected = response.expectedContentLength <= Int64(BridgeConfiguration.maximumResponseBytes)
+        let expected = response.expectedContentLength <= Int64(context.request.maximumResponseBytes)
             ? response.expectedContentLength
             : -1
-        let metadata = BridgeHTTPResponseMetadata(
+        var metadata = BridgeHTTPResponseMetadata(
             statusCode: response.statusCode,
             headers: policy.allowedResponseHeaders(response.allHeaderFields),
             expectedBodyLength: expected
@@ -366,11 +414,27 @@ extension HTTPSNetworkClient: URLSessionDataDelegate {
             || contentType.hasPrefix("audio/mpeg")
             || contentType.hasPrefix("audio/mp3")
             || contentType.hasPrefix("audio/x-mpeg") {
+            if context.request.bluetooth || response.statusCode != 200 {
+                completionHandler(.cancel)
+                fail(context, with: .invalidResponse)
+                return
+            }
             context.streamsRadioAudio = true
+            if context.expectsRadioPCM {
+                guard let decoder = RadioPCMDecoder() else {
+                    completionHandler(.cancel)
+                    fail(context, with: .transportFailure)
+                    return
+                }
+                context.pcmDecoder = decoder
+                metadata = BridgeHTTPResponseMetadata(statusCode: response.statusCode,
+                    headers: [.init(name: "content-type", value: "audio/x-fib-pcm;rate=14493;channels=1;format=s16le")],
+                    expectedBodyLength: -1)
+            }
             context.deadlineWorkItem?.cancel()
             context.deadlineWorkItem = nil
         }
-        if context.transformsNationalToday || context.transformsRadioBrowser {
+        if context.transformsNationalToday || context.transformsRadioBrowser || context.toolboxKind != nil {
             context.delayedResponse = metadata
         } else {
             context.onResponse(metadata)
@@ -385,7 +449,34 @@ extension HTTPSNetworkClient: URLSessionDataDelegate {
     ) {
         guard let context = contextsByTaskID[dataTask.taskIdentifier], !context.finished else { return }
         if context.streamsRadioAudio {
-            let remaining = BridgeConfiguration.maximumResponseBytes - context.bytesReceived
+            if let decoder = context.pcmDecoder {
+                context.radioSourceBytes += data.count
+                for offset in stride(from: 0, to: data.count, by: 4096) {
+                    let pcm = decoder.feed(data.subdata(in: offset..<min(offset + 4096, data.count)))
+                    if context.bytesReceived + pcm.count > context.request.maximumResponseBytes ||
+                       context.radioBuffer.count - context.radioReadOffset + pcm.count > 1_048_576 {
+                        fail(context, with: .responseTooLarge)
+                        return
+                    }
+                    context.bytesReceived += pcm.count
+                    context.radioBuffer.append(pcm)
+                }
+                // Live servers can deliver large initial bursts. Suspend the
+                // source before the bounded reservoir fills; do not truncate
+                // and reconnect an otherwise healthy station every few seconds.
+                if !context.radioSourcePaused &&
+                    context.radioBuffer.count - context.radioReadOffset >= 524_288 {
+                    context.radioSourcePaused = true
+                    dataTask.suspend()
+                }
+                if context.radioSourceBytes > 131072 && context.bytesReceived == 0 {
+                    fail(context, with: .invalidResponse)
+                    return
+                }
+                startRadioDrainIfReady(context)
+                return
+            }
+            let remaining = context.request.maximumResponseBytes - context.bytesReceived
             guard remaining > 0 else {
                 fail(context, with: .responseTooLarge)
                 return
@@ -397,8 +488,8 @@ extension HTTPSNetworkClient: URLSessionDataDelegate {
             if data.count > remaining { fail(context, with: .responseTooLarge) }
             return
         }
-        if context.transformsNationalToday || context.transformsRadioBrowser {
-            let maximumBytes = context.transformsNationalToday
+        if context.transformsNationalToday || context.transformsRadioBrowser || context.toolboxKind != nil {
+            let maximumBytes = context.toolboxKind != nil ? ToolboxExtractor.maximumSourceBytes : context.transformsNationalToday
                 ? NationalTodayExtractor.maximumHTMLBytes
                 : RadioBrowserExtractor.maximumJSONBytes
             guard context.bufferedHTML.count + data.count <= maximumBytes else {
@@ -408,7 +499,7 @@ extension HTTPSNetworkClient: URLSessionDataDelegate {
             context.bufferedHTML.append(data)
             return
         }
-        let remaining = BridgeConfiguration.maximumResponseBytes - context.bytesReceived
+        let remaining = context.request.maximumResponseBytes - context.bytesReceived
         if remaining > 0 {
             let accepted = data.prefix(remaining)
             if !accepted.isEmpty {
@@ -510,13 +601,40 @@ extension HTTPSNetworkClient {
             finish(context, result: .failure(.timeout))
         } else if error != nil {
             finish(context, result: .failure(.transportFailure))
+        } else if context.streamsRadioAudio {
+            context.radioSourceEnded = true
+            if context.bytesReceived == 0 { finish(context, result: .failure(.invalidResponse)) }
+            else { startRadioDrainIfReady(context) }
         } else if context.transformsNationalToday {
             completeNationalToday(context)
         } else if context.transformsRadioBrowser {
             completeRadioBrowser(context)
+        } else if context.toolboxKind != nil {
+            completeToolbox(context)
         } else {
             finish(context, result: .success(()))
         }
+    }
+
+    private func completeToolbox(_ context: Context) {
+        guard let response = context.delayedResponse, let kind = context.toolboxKind else {
+            finish(context, result: .failure(.invalidResponse))
+            return
+        }
+        guard response.statusCode == 200 else {
+            context.onResponse(BridgeHTTPResponseMetadata(statusCode: response.statusCode, headers: [], expectedBodyLength: 0))
+            finish(context, result: .success(()))
+            return
+        }
+        guard let compact = ToolboxExtractor.extract(kind, from: context.bufferedHTML) else {
+            finish(context, result: .failure(.invalidResponse))
+            return
+        }
+        context.onResponse(BridgeHTTPResponseMetadata(statusCode: 200,
+            headers: [BridgeHTTPHeader(name: "content-type", value: "text/plain; charset=us-ascii")],
+            expectedBodyLength: Int64(compact.count)))
+        context.onData(compact)
+        finish(context, result: .success(()))
     }
 
     private func completeNationalToday(_ context: Context) {

@@ -36,12 +36,13 @@ class BridgeHost:
         permission_store: PermissionStore,
         automatic_permission: PermissionDecision | None,
         verbose: bool,
+        bluetooth: bool = False,
     ):
         self.permission_store = permission_store
         self.automatic_permission = automatic_permission
         self.verbose = verbose
         self.outgoing: queue.Queue[Frame] = queue.Queue(maxsize=256)
-        self.session = HostSession(self._start_request, permission_store.contains)
+        self.session = HostSession(self._start_request, permission_store.contains, bluetooth=bluetooth)
         self._network_threads: set[threading.Thread] = set()
 
     def log(self, message: str) -> None:
@@ -86,16 +87,20 @@ class BridgeHost:
 
         def on_chunk(chunk: bytes) -> None:
             nonlocal sequence, sent
-            self._put(
-                Frame(
-                    MessageType.RESPONSE_BODY_CHUNK,
-                    chunk,
-                    request_id=request.request_id,
-                    sequence=sequence,
+            # Decoder delivery blocks are not wire frames. All transports must
+            # respect the FAP's 192-byte response-body limit, even for audio.
+            for offset in range(0, len(chunk), 192):
+                part = chunk[offset:offset + 192]
+                self._put(
+                    Frame(
+                        MessageType.RESPONSE_BODY_CHUNK,
+                        part,
+                        request_id=request.request_id,
+                        sequence=sequence,
+                    )
                 )
-            )
-            sequence += 1
-            sent += len(chunk)
+                sequence += 1
+                sent += len(part)
 
         try:
             result = perform_request(
@@ -106,12 +111,13 @@ class BridgeHost:
                 request.cancel,
                 on_start,
                 on_chunk,
+                request.bluetooth,
             )
             if started:
                 outcome = 2 if result.cancelled else (1 if result.truncated else 0)
                 self._put(
                     response_end_frame(
-                        request.request_id, sequence, outcome, result.bytes_sent
+                        request.request_id, sequence, outcome, result.bytes_sent, request.maximum_response_bytes
                     )
                 )
             self.debug(
@@ -190,27 +196,39 @@ def _write_frames(connection, frames: Sequence[Frame], verbose: bool) -> None:
                 file=sys.stderr,
             )
         connection.write(encode_frame(frame))
-    connection.flush()
+    # pyserial.write submits bytes directly to the driver. tcdrain/flush can
+    # wait indefinitely on USB CDC (even for an empty batch), starving inbound
+    # consent, cancellation and shutdown. write_timeout bounds each write.
 
 
-def serve_port(device: str, host: BridgeHost, handshake_timeout: float = 8.0) -> bool:
+def serve_port(device: str, host: BridgeHost, handshake_timeout: float = 8.0,
+               stop: threading.Event | None = None, on_tick=None, on_update=None) -> bool:
     print(f"Opening {device}", file=sys.stderr, flush=True)
-    connection = open_serial(device)
+    connection = open_serial(device, timeout=0.016)
     decoder = StreamDecoder(
         lambda issue: host.debug(f"parser: {issue.code}: {issue.detail}")
     )
     connected_at = time.monotonic()
     handshaken = False
     try:
-        while True:
-            while True:
+        while stop is None or not stop.is_set():
+            # Desktop commands run on the transport owner, never the GUI thread.
+            if on_tick is not None:
+                _write_frames(connection, on_tick(host), host.verbose)
+            # A continuous PCM producer must not starve inbound Cancel/Ping.
+            # Bound each write batch, then service the duplex receive side.
+            for _ in range(8):
                 try:
                     frame = host.outgoing.get_nowait()
                 except queue.Empty:
                     break
                 _write_frames(connection, [frame], host.verbose)
 
-            data = connection.read(4096)
+            data = connection.read(min(max(connection.in_waiting, 1), 4096))
+            if on_update is not None:
+                on_update(host)
+            if host.session.permission_pending:
+                _write_frames(connection, host.resolve_permission(), host.verbose)
             if not data:
                 if (
                     not handshaken
@@ -232,11 +250,14 @@ def serve_port(device: str, host: BridgeHost, handshake_timeout: float = 8.0) ->
                             flush=True,
                         )
                 _write_frames(connection, responses, host.verbose)
+                if frame.message_type == MessageType.DISCONNECT:
+                    return handshaken
                 if host.session.permission_pending:
                     _write_frames(connection, host.resolve_permission(), host.verbose)
     finally:
         host.close()
         connection.close()
+    return handshaken
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -266,6 +287,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="exit after the selected port disconnects"
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--demo", action="store_true", help="open the Bluetooth Demo / Pairings menu")
+    parser.add_argument("--bluetooth-demo", action="store_true", help="enable opt-in BLE demo (fresh internet consent)")
+    parser.add_argument("--pairings", action="store_true", help="list Bluetooth bridge pairings")
+    parser.add_argument("--revoke-pairing", metavar="ID", help="remove a listed bridge pairing, not OS bonds or USB permission")
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
@@ -274,6 +299,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.demo or args.bluetooth_demo or args.pairings or args.revoke_pairing:
+        if args.port or args.allow_once or args.deny or args.list_ports:
+            print("Bluetooth Demo requires its own fresh consent; do not combine USB/automatic-permission options.", file=sys.stderr)
+            return 2
+        from .bluetooth_demo import main_demo
+        return main_demo(args)
     candidates = serial_candidates()
     if args.list_ports:
         for candidate in candidates:

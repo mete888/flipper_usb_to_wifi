@@ -14,6 +14,10 @@ The CDC transport is an arbitrary byte stream: a USB transfer can contain a
 partial frame, one frame, or several frames. Only this format defines boundaries.
 The words MUST, MUST NOT, SHOULD, and MAY are normative.
 
+The local Bluetooth Alpha uses the same framing with a separate, BLE-only
+[bridge recognition extension](bluetooth-pairing.md) before HELLO_ACK. Its code
+messages and tokens never apply to USB, and do not replace internet consent.
+
 ## 2. Frame format
 
 Each frame has a fixed 28-byte header, `payload_length` payload bytes, and a
@@ -127,6 +131,29 @@ Capability bits:
 | `0x00000004` | Request headers |
 | `0x00000008` | Response headers |
 | `0x00000010` | Cancellation |
+| `0x00000400` | USB radio PCM: host decodes MP3 to mono 14493 Hz s16le |
+
+The USB-only PCM extension is negotiated, never assumed. Bits 7–9 from the
+withdrawn Bluetooth radio experiment stay reserved. A PCM request uses
+`Accept: audio/mpeg; fib-pcm=14493`; the host sends plain `Accept: audio/mpeg`
+to the HTTPS source and returns exactly
+`content-type: audio/x-fib-pcm;rate=14493;channels=1;format=s16le`.
+The FAP refuses audio bodies without this header and capability. PCM samples
+may span body chunks (low byte first), but total body length must be even.
+All CRC, sequence, permission, HTTPS/SSRF, cancellation and inactivity rules
+still apply. Bluetooth audio remains disabled.
+
+PCM-capable USB peers may negotiate a bounded 64 MiB radio segment to avoid
+rebuffering every two minutes. Ordinary requests remain capped at 4 MiB and
+Bluetooth text at 8 KiB. The host reservoir is bounded at 1 MiB; Flipper keeps
+the original 8192-sample PCM reservoir, no MP3 thread or compressed reservoir.
+There is no new lossy compression or output sample-rate reduction.
+USB receivers leave an endpoint packet unread while the speaker ring is full,
+allowing hardware backpressure rather than discarding bytes. Desktop write
+queues are bounded; networking is paused when its PCM reservoir reaches the
+high-water mark and resumed after draining. A cancelled request ID may still
+have already queued, CRC-valid response frames: discard those without audio
+delivery or ERROR storms. Other IDs and malformed frames retain normal checks.
 
 ### 6.2 HELLO_ACK (`request_id=0`, `sequence=0`)
 

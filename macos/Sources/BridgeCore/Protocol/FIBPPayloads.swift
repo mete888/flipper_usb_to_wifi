@@ -10,8 +10,10 @@ public struct FIBPCapabilities: OptionSet, Equatable, Sendable {
     public static let requestHeaders = FIBPCapabilities(rawValue: 0x0000_0004)
     public static let responseHeaders = FIBPCapabilities(rawValue: 0x0000_0008)
     public static let cancellation = FIBPCapabilities(rawValue: 0x0000_0010)
+    // 0x380 belonged to the withdrawn radio experiment; keep those bits reserved.
+    public static let usbRadioPCM = FIBPCapabilities(rawValue: 0x0000_0400)
     public static let helperSupported: FIBPCapabilities = [
-        .httpsGET, .httpsPOST, .requestHeaders, .responseHeaders, .cancellation,
+        .httpsGET, .httpsPOST, .requestHeaders, .responseHeaders, .cancellation, .usbRadioPCM,
     ]
 }
 

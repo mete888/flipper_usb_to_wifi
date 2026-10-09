@@ -7,12 +7,13 @@ project_root="${script_dir:h}"
 macos_root="$project_root/macos"
 output_root="$project_root/dist/macos"
 app_name="Flipper Internet Bridge"
-app_path="$output_root/$app_name.app"
+# Spotlight must see only the installed application, not the build staging copy.
+app_path="$output_root/Build.noindex/$app_name.app"
 dmg_path="$output_root/Flipper-Internet-Bridge.dmg"
 scratch_path="$macos_root/.build-package"
 module_cache="$scratch_path/module-cache"
 
-mkdir -p "$output_root" "$module_cache"
+mkdir -p "$output_root/Build.noindex" "$module_cache"
 
 echo "Building the macOS helper in release mode..."
 (

@@ -50,4 +50,3 @@ public struct BridgeStatusSnapshot: Equatable, Sendable {
         permission == .allowedOnce || permission == .alwaysAllowed
     }
 }
-

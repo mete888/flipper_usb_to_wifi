@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from scripts.fibp_codec import HeaderField, RequestStart, encode_header
 
 from .transforms import apply_transform, maximum_source_bytes, transform_for
+from .radio_pcm import PCM_ACCEPT, PCM_TYPE, stream_pcm
 
 MAX_REDIRECTS = 3
 MAX_RESPONSE_HEADERS = 8
@@ -140,11 +141,11 @@ def _request_once(
             "Host": host_header,
             "Connection": "close",
             "Accept-Encoding": "identity",
-            "User-Agent": "Flipper-USB-Internet-Bridge/0.3",
+            "User-Agent": "Flipper-USB-Internet-Bridge/0.5",
         }
         for item in headers:
             if item.name.lower() in REQUEST_HEADER_ALLOWLIST:
-                outgoing[item.name] = item.value
+                outgoing[item.name] = "audio/mpeg" if item.name.lower() == "accept" and item.value.lower() == PCM_ACCEPT else item.value
         if body:
             outgoing["Content-Length"] = str(len(body))
         request_head = (
@@ -169,7 +170,12 @@ def perform_request(
     cancel: Event,
     on_start: Callable[[int, list[HeaderField], int], None],
     on_chunk: Callable[[bytes], None],
+    bluetooth: bool = False,
 ) -> FetchResult:
+    if bluetooth:
+        maximum_bytes = min(maximum_bytes, 8192)
+        if any(h.name.lower() == "accept" and "audio/" in h.value.lower() for h in headers):
+            raise NetworkRequestError("Internet radio requires USB")
     method = "GET" if start.method == 1 else "POST"
     current_url = start.url
     current_body = body
@@ -202,13 +208,16 @@ def perform_request(
 
             transform = transform_for(start)
             if transform is not None:
+                if response.status != 200:
+                    on_start(response.status, [], 0)
+                    return FetchResult(0, False, cancel.is_set())
                 source_limit = maximum_source_bytes(transform)
                 source = response.read(source_limit + 1)
                 if len(source) > source_limit:
                     raise NetworkRequestError(
                         "special endpoint response exceeds its source limit"
                     )
-                transformed = apply_transform(transform, source)[:maximum_bytes]
+                transformed = apply_transform(transform, source, 64)[:maximum_bytes]
                 transformed_headers = [
                     HeaderField("content-type", "text/plain; charset=utf-8")
                 ]
@@ -240,6 +249,15 @@ def perform_request(
                 parsed = int(content_length)
                 if parsed <= maximum_bytes:
                     declared = parsed
+            if bluetooth and (response.getheader("Content-Type") or "").lower().startswith("audio/"):
+                raise NetworkRequestError("Internet radio requires USB")
+            wants_pcm = any(h.name.lower() == "accept" and h.value.lower() == PCM_ACCEPT for h in headers)
+            if wants_pcm:
+                if bluetooth or response.status != 200:
+                    raise NetworkRequestError("USB radio requires a successful MP3 response")
+                on_start(response.status, [HeaderField("content-type", PCM_TYPE)], 0xFFFFFFFF)
+                return FetchResult(*stream_pcm(response, connection, cancel, maximum_bytes,
+                    min(start.timeout_ms / 1000, 30), on_chunk))
             on_start(response.status, response_headers, declared)
 
             sent = 0

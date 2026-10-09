@@ -7,6 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from threading import Event, Lock
+BLE_TEXT_LIMIT = 8192
+from .radio_pcm import AVAILABLE as RADIO_AVAILABLE, PCM_ACCEPT, PCM_LIMIT
 
 from scripts.fibp_codec import (
     MAX_REQUEST_BODY_BYTES,
@@ -61,6 +63,7 @@ class CompletedRequest:
     maximum_response_bytes: int
     next_client_sequence: int
     cancel: Event
+    bluetooth: bool = False
 
 
 RequestCallback = Callable[[CompletedRequest], None]
@@ -82,13 +85,20 @@ class HostSession:
         | Capability.CANCELLATION
     )
 
+    # Do not claim audio decoding when the optional compiled module is missing.
+    if RADIO_AVAILABLE:
+        CAPABILITIES |= int(Capability.USB_RADIO_PCM)
+
     def __init__(
         self,
         on_request: RequestCallback,
         persistent_permission: Callable[[Hello], bool],
+        bluetooth: bool = False,
     ):
         self.on_request = on_request
         self.persistent_permission = persistent_permission
+        self.bluetooth = bluetooth
+        self.response_limit = BLE_TEXT_LIMIT if bluetooth else MAX_RESPONSE_BODY_BYTES
         self.hello: Hello | None = None
         self.permission = PermissionDecision.DENY
         self.permission_pending = False
@@ -175,11 +185,14 @@ class HostSession:
                         )
                     ]
                 self._reset_for_hello(hello)
-                limit = min(hello.maximum_response_bytes, MAX_RESPONSE_BODY_BYTES)
+                self.response_limit = BLE_TEXT_LIMIT if self.bluetooth else (
+                    PCM_LIMIT if RADIO_AVAILABLE and hello.capabilities & int(Capability.USB_RADIO_PCM)
+                    else MAX_RESPONSE_BODY_BYTES)
+                limit = min(hello.maximum_response_bytes, self.response_limit)
                 ack = HelloAck(
                     1,
                     0,
-                    hello.capabilities & self.CAPABILITIES,
+                    hello.capabilities & self.CAPABILITIES & (~int(Capability.HTTPS_POST | Capability.USB_RADIO_PCM) if self.bluetooth else 0xFFFFFFFF),
                     min(hello.maximum_rx_payload, 512),
                     limit,
                     hello.client_nonce,
@@ -188,7 +201,7 @@ class HostSession:
                 responses = [
                     self._control_frame(MessageType.HELLO_ACK, encode_hello_ack(ack))
                 ]
-                if self.persistent_permission(hello):
+                if not self.bluetooth and self.persistent_permission(hello):
                     self.permission = PermissionDecision.ALLOW_ALWAYS
                     responses.append(
                         self._control_frame(
@@ -272,9 +285,10 @@ class HostSession:
                             ErrorCode.DUPLICATE_REQUEST_ID, frame, "request id reused"
                         )
                     ]
-                self.pending = PendingRequest(
-                    frame.request_id, decode_request_start(frame.payload)
-                )
+                start = decode_request_start(frame.payload)
+                if self.bluetooth and (start.method != 1 or start.declared_body_length):
+                    return [self._error(ErrorCode.INVALID_REQUEST, frame, "Bluetooth Demo supports GET only")]
+                self.pending = PendingRequest(frame.request_id, start)
                 return []
             if message_type in {
                 MessageType.REQUEST_HEADER,
@@ -299,6 +313,9 @@ class HostSession:
                 pending.expected_sequence += 1
                 if message_type == MessageType.REQUEST_HEADER:
                     header = decode_header(frame.payload)
+                    if self.bluetooth and header.name.lower() == "accept" and "audio/mpeg" in header.value.lower():
+                        self.pending = None
+                        return [self._error(ErrorCode.INVALID_REQUEST, frame, "Internet radio requires USB")]
                     pending.headers.append(header)
                     pending.header_bytes += len(header.name.encode()) + len(
                         header.value.encode()
@@ -347,14 +364,20 @@ class HostSession:
                             ErrorCode.INVALID_REQUEST, frame, "request is incomplete"
                         )
                     ]
+                response_limit = self.response_limit
+                if not self.bluetooth and not any(
+                    h.name.lower() == "accept" and h.value.lower() == PCM_ACCEPT for h in pending.headers
+                ):
+                    response_limit = min(response_limit, MAX_RESPONSE_BODY_BYTES)
                 completed = CompletedRequest(
                     pending.request_id,
                     pending.start,
                     tuple(pending.headers),
                     bytes(pending.body),
-                    min(self.hello.maximum_response_bytes, MAX_RESPONSE_BODY_BYTES),
+                    min(self.hello.maximum_response_bytes, response_limit),
                     pending.expected_sequence,
                     Event(),
+                    self.bluetooth,
                 )
                 self.pending = None
                 self.active = completed
@@ -405,6 +428,8 @@ class HostSession:
         if not self.permission_pending:
             return []
         self.permission_pending = False
+        if self.bluetooth and decision == PermissionDecision.ALLOW_ALWAYS:
+            decision = PermissionDecision.DENY
         self.permission = decision
         return [
             self._control_frame(
@@ -460,13 +485,14 @@ def response_end_frame(
     sequence: int,
     result: int,
     bytes_sent: int,
+    maximum_bytes: int = MAX_RESPONSE_BODY_BYTES,
 ) -> Frame:
     flags = FrameFlags.FINAL | (
         FrameFlags.TRUNCATED if result == 1 else FrameFlags.NONE
     )
     return Frame(
         MessageType.RESPONSE_END,
-        encode_response_end(ResponseEnd(result, bytes_sent)),
+        encode_response_end(ResponseEnd(result, bytes_sent), maximum_bytes),
         request_id=request_id,
         sequence=sequence,
         flags=flags,

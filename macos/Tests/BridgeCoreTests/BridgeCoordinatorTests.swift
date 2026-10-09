@@ -3,6 +3,42 @@ import XCTest
 @testable import BridgeCore
 
 final class BridgeCoordinatorTests: XCTestCase {
+    func testTwoTransportSessionsKeepConsentRequestsAndDisconnectIndependent() throws {
+        let usbStore = InMemoryPermissionStore()
+        usbStore.grant(Harness.identity)
+        let usb = Harness(permissionStore: usbStore)
+        let peer = SerialDevice(registryID: 456, calloutPath: "ble-alpha:test", linkKind: .bluetoothAlpha)
+        let bluetooth = Harness(allowPersistentPermissions: false, device: peer)
+        defer { usb.stop(); bluetooth.stop() }
+        try usb.connect()
+        usb.sendHello()
+        XCTAssertTrue(waitUntil { usb.coordinator.snapshot().state == .ready })
+        try bluetooth.connect()
+        bluetooth.sendHello()
+        XCTAssertTrue(waitUntil { bluetooth.prompt.requestCount == 1 })
+        XCTAssertEqual(usb.prompt.requestCount, 0)
+        bluetooth.prompt.decide(.deny)
+        XCTAssertTrue(waitUntil { bluetooth.coordinator.snapshot().state == .permissionDenied })
+        usb.sendGET(requestID: 1)
+        XCTAssertTrue(waitUntil { usb.http.executeCount == 1 })
+        bluetooth.coordinator.grantAlwaysForCurrentDevice()
+        XCTAssertTrue(waitUntil { bluetooth.coordinator.snapshot().state == .ready })
+        bluetooth.sendGET(requestID: 1) // IDs are scoped to each connection.
+        XCTAssertTrue(waitUntil { bluetooth.http.executeCount == 1 })
+        let usbCancelCount = usb.http.cancelCount
+        bluetooth.coordinator.revokeCurrentDevicePermission()
+        XCTAssertTrue(waitUntil { bluetooth.coordinator.snapshot().state == .permissionDenied })
+        XCTAssertEqual(usb.coordinator.snapshot().activeRequestID, 1)
+        XCTAssertEqual(usb.http.cancelCount, usbCancelCount)
+        XCTAssertTrue(usbStore.contains(Harness.identity))
+        bluetooth.stop()
+        XCTAssertTrue(usb.transport.isOpen)
+        XCTAssertTrue(usb.coordinator.snapshot().internetAccessEnabled)
+        XCTAssertEqual(usb.coordinator.snapshot().activeRequestID, 1)
+        usb.monitor.remove(Harness.device)
+        XCTAssertTrue(waitUntil { usb.coordinator.snapshot().state == .disconnected })
+    }
+
     func testSuccessfulHandshakePermissionAndHTTPSGETChunking() throws {
         let harness = Harness()
         defer { harness.stop() }
@@ -689,6 +725,134 @@ final class BridgeCoordinatorTests: XCTestCase {
         harness.sendGET(requestID: 1)
         XCTAssertTrue(waitUntil { harness.http.request?.requestID == 1 })
     }
+    func testBluetoothAlphaIgnoresSavedUSBPermissionAndNeverPersists() throws {
+        let store = InMemoryPermissionStore()
+        store.grant(Harness.identity)
+        let harness = Harness(permissionStore: store, allowPersistentPermissions: false)
+        defer { harness.stop() }
+        try harness.connect()
+        harness.sendHello()
+        XCTAssertTrue(waitUntil { harness.prompt.requestCount == 1 })
+        XCTAssertNil(harness.http.request)
+        harness.prompt.decide(.alwaysAllow)
+        XCTAssertTrue(waitUntil { harness.coordinator.snapshot().permission == .allowedOnce })
+        harness.coordinator.grantAlwaysForCurrentDevice()
+        XCTAssertTrue(waitUntil { harness.transport.frames.filter { $0.messageType == .permissionStatus }.count >= 2 })
+        XCTAssertEqual(harness.coordinator.snapshot().permission, .allowedOnce)
+        harness.monitor.remove(Harness.device)
+        XCTAssertTrue(waitUntil { !harness.coordinator.snapshot().isConnected })
+        harness.monitor.add(Harness.device)
+        XCTAssertTrue(waitUntil { harness.transport.isOpen })
+        harness.sendHello()
+        XCTAssertTrue(waitUntil { harness.prompt.requestCount == 2 })
+        XCTAssertNil(harness.coordinator.snapshot().permission)
+    }
+
+    func testBluetoothAlphaResponseLimitAndDisconnectCancelsRequest() throws {
+        let harness = Harness(allowPersistentPermissions: false, maximumResponseBytes: 8192)
+        defer { harness.stop() }
+        try harness.connect()
+        harness.sendHello()
+        XCTAssertTrue(waitUntil { harness.prompt.requestCount == 1 })
+        harness.prompt.decide(.allowOnce)
+        XCTAssertTrue(waitUntil { harness.coordinator.snapshot().state == .ready })
+        let ack = try XCTUnwrap(harness.transport.frames.first { $0.messageType == .helloAck })
+        XCTAssertEqual(ack.payload.count, 28)
+        let limit = ack.payload[8..<12].enumerated().reduce(UInt32(0)) {
+            $0 | (UInt32($1.element) << (8 * $1.offset))
+        }
+        XCTAssertEqual(limit, 8192)
+        harness.sendGET(requestID: 77)
+        XCTAssertTrue(waitUntil { harness.http.request?.requestID == 77 })
+        harness.http.respond(status: 200)
+        harness.http.send(Data(repeating: 65, count: 9000))
+        XCTAssertTrue(waitUntil {
+            harness.transport.frames.filter { $0.messageType == .responseBodyChunk }.reduce(0) { $0 + $1.payload.count } == 8192
+        })
+        let cancels = harness.http.cancelCount
+        harness.monitor.remove(Harness.device)
+        XCTAssertTrue(waitUntil { harness.http.cancelCount > cancels })
+        XCTAssertNil(harness.coordinator.snapshot().activeRequestID)
+        XCTAssertNil(harness.coordinator.snapshot().permission)
+    }
+
+    func testBluetoothPeerCannotStartPOSTOrUnprofiledRadio() throws {
+        let peer = SerialDevice(registryID: 12, calloutPath: "ble-alpha:test", linkKind: .bluetoothAlpha)
+        let harness = Harness(allowPersistentPermissions: false, device: peer)
+        defer { harness.stop() }
+        try harness.connect()
+        harness.sendHello()
+        XCTAssertTrue(waitUntil { harness.prompt.requestCount == 1 })
+        harness.prompt.decide(.allowOnce)
+        XCTAssertTrue(waitUntil { harness.coordinator.snapshot().state == .ready })
+        let post = FIBPRequestStart(method: .post, timeoutMilliseconds: 2000,
+            url: "https://example.com/demo", declaredBodyLength: 0, declaredHeaderCount: 0)
+        harness.inject(FIBPFrame(messageType: .requestStart, requestID: 1, sequence: 0, payload: post.encoded))
+        XCTAssertTrue(waitUntil { harness.transport.frames.contains { $0.messageType == .error && $0.requestID == 1 } })
+        let radio = FIBPRequestStart(method: .get, timeoutMilliseconds: 2000,
+            url: "https://example.com/radio", declaredBodyLength: 0, declaredHeaderCount: 1)
+        harness.inject(FIBPFrame(messageType: .requestStart, requestID: 2, sequence: 0, payload: radio.encoded))
+        harness.inject(FIBPFrame(messageType: .requestHeader, requestID: 2, sequence: 1,
+            payload: BridgeHTTPHeader(name: "Accept", value: "audio/mpeg").encoded))
+        XCTAssertTrue(waitUntil { harness.transport.frames.contains { $0.messageType == .error && $0.requestID == 2 } })
+        XCTAssertNil(harness.http.request)
+        XCTAssertNil(harness.coordinator.snapshot().activeRequestID)
+    }
+
+    func testUSBMP3StillStreamsBeyondBluetoothTextLimitAndCancels() throws {
+        let harness = Harness()
+        defer { harness.stop() }
+        try harness.readyConnection()
+        let start = FIBPRequestStart(method: .get, timeoutMilliseconds: 30000,
+            url: "https://example.com/live", declaredBodyLength: 0, declaredHeaderCount: 1)
+        harness.inject(FIBPFrame(messageType: .requestStart, requestID: 1, sequence: 0, payload: start.encoded))
+        harness.inject(FIBPFrame(messageType: .requestHeader, requestID: 1, sequence: 1,
+            payload: BridgeHTTPHeader(name: "accept", value: "audio/mpeg").encoded))
+        harness.inject(FIBPFrame(messageType: .requestEnd, flags: [.final], requestID: 1, sequence: 2))
+        XCTAssertTrue(waitUntil { harness.http.executeCount == 1 })
+        XCTAssertEqual(harness.http.request?.maximumResponseBytes, BridgeConfiguration.maximumResponseBytes)
+        XCTAssertEqual(harness.http.request?.bluetooth, false)
+        harness.http.respond(status: 200)
+        harness.http.send(Data(repeating: 0x55, count: 16384))
+        XCTAssertTrue(waitUntil {
+            harness.transport.frames.filter { $0.messageType == .responseBodyChunk }.reduce(0) { $0 + $1.payload.count } == 16384
+        })
+        let count = harness.http.cancelCount
+        harness.inject(FIBPFrame(messageType: .cancel, requestID: 1, sequence: 3, payload: Data([0])))
+        XCTAssertTrue(waitUntil { harness.http.cancelCount > count })
+        XCTAssertNil(harness.coordinator.snapshot().activeRequestID)
+    }
+
+    func testBluetoothPlainGETKeepsEightKiBLimitAfterRadioNegotiation() throws {
+        let peer = SerialDevice(registryID: 12, calloutPath: "ble-alpha:test", linkKind: .bluetoothAlpha)
+        let harness = Harness(allowPersistentPermissions: false, device: peer)
+        defer { harness.stop() }
+        try harness.readyConnection()
+        harness.sendGET(requestID: 1)
+        XCTAssertTrue(waitUntil { harness.http.executeCount == 1 })
+        XCTAssertEqual(harness.http.request?.maximumResponseBytes, 8192)
+        harness.http.respond(status: 200)
+        harness.http.send(Data(repeating: 65, count: 9000))
+        XCTAssertEqual(harness.transport.frames.filter { $0.messageType == .responseBodyChunk }.reduce(0) { $0 + $1.payload.count }, 8192)
+        XCTAssertGreaterThan(harness.http.cancelCount, 0)
+    }
+
+    func testBluetoothRejectsEveryFormerRadioProfileEvenFromOldFAP() throws {
+        for value in ["audio/mpeg", "audio/mpeg; fib-rate=32", "audio/mpeg; fib-pcm=4000", "audio/mpeg; fib-adpcm=4000"] {
+            let peer = SerialDevice(registryID: 12, calloutPath: "ble-alpha:test", linkKind: .bluetoothAlpha)
+            let harness = Harness(allowPersistentPermissions: false, device: peer)
+            defer { harness.stop() }
+            let caps = FIBPCapabilities(rawValue: 0x39f)
+            try harness.readyConnection(hello: Harness.makeHello(capabilities: caps))
+            let start = FIBPRequestStart(method: .get, timeoutMilliseconds: 30000,
+                url: "https://example.com/live", declaredBodyLength: 0, declaredHeaderCount: 1)
+            harness.inject(FIBPFrame(messageType: .requestStart, requestID: 1, sequence: 0, payload: start.encoded))
+            harness.inject(FIBPFrame(messageType: .requestHeader, requestID: 1, sequence: 1,
+                payload: BridgeHTTPHeader(name: "accept", value: value).encoded))
+            XCTAssertTrue(waitUntil { harness.transport.frames.contains { $0.messageType == .error && $0.requestID == 1 } })
+            XCTAssertNil(harness.http.request)
+        }
+    }
 }
 
 private final class Harness {
@@ -738,13 +902,18 @@ private final class Harness {
     let prompt = MockPermissionPrompt()
     let http = MockHTTPClient()
     let coordinator: BridgeCoordinator
+    private let device: SerialDevice
 
     init(
         permissionStore: any PermissionStoring = InMemoryPermissionStore(),
         idleSessionTimeout: TimeInterval = BridgeConfiguration.idleSessionTimeout,
         pongTimeout: TimeInterval = BridgeConfiguration.pongTimeout,
-        requestAssemblyTimeout: TimeInterval = BridgeConfiguration.requestAssemblyTimeout
+        requestAssemblyTimeout: TimeInterval = BridgeConfiguration.requestAssemblyTimeout,
+        allowPersistentPermissions: Bool = true,
+        maximumResponseBytes: Int = BridgeConfiguration.maximumResponseBytes,
+        device: SerialDevice = Harness.device
     ) {
+        self.device = device
         coordinator = BridgeCoordinator(
             monitor: monitor,
             transport: transport,
@@ -753,13 +922,15 @@ private final class Harness {
             httpClient: http,
             idleSessionTimeout: idleSessionTimeout,
             pongTimeout: pongTimeout,
-            requestAssemblyTimeout: requestAssemblyTimeout
+            requestAssemblyTimeout: requestAssemblyTimeout,
+            allowPersistentPermissions: allowPersistentPermissions,
+            maximumResponseBytes: maximumResponseBytes
         )
     }
 
     func connect() throws {
         try coordinator.start()
-        monitor.add(Self.device)
+        monitor.add(device)
         XCTAssertTrue(waitUntil { self.transport.isOpen })
     }
 

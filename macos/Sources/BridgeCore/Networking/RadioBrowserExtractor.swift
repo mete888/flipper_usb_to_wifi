@@ -13,7 +13,7 @@ enum RadioBrowserExtractor {
             components.path == "/json/stations/search"
     }
 
-    static func extract(from data: Data) -> Data? {
+    static func extract(from data: Data, maximumBitrate: Int = 64) -> Data? {
         guard let objects = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return nil
         }
@@ -30,7 +30,7 @@ enum RadioBrowserExtractor {
             let country = field(object["country"] as? String, fallback: "Unknown", limit: 24)
             let state = field(object["state"] as? String, fallback: "", limit: 24)
             let bitrate = (object["bitrate"] as? NSNumber)?.intValue ?? 0
-            guard (8...64).contains(bitrate) else { continue }
+            guard bitrate >= 8, bitrate <= min(64, maximumBitrate) else { continue }
             lines.append([name, country, state, String(bitrate), rawURL].joined(separator: "\t"))
         }
 

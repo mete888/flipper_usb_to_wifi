@@ -21,10 +21,8 @@ enum NationalTodayExtractor {
         else { return nil }
 
         let fragment = String(html[contentStart.upperBound..<paragraphEnd.lowerBound])
-            .replacingOccurrences(of: "<b>", with: "[[B]]", options: .caseInsensitive)
-            .replacingOccurrences(of: "</b>", with: "[[/B]]", options: .caseInsensitive)
-            .replacingOccurrences(of: "<strong>", with: "[[B]]", options: .caseInsensitive)
-            .replacingOccurrences(of: "</strong>", with: "[[/B]]", options: .caseInsensitive)
+            .replacingOccurrences(of: "(?i)<(?:b|strong)(?:\\s[^>]*)?>", with: "[[B]]", options: .regularExpression)
+            .replacingOccurrences(of: "(?i)</(?:b|strong)>", with: "[[/B]]", options: .regularExpression)
         let plain = decodeEntities(stripTags(fragment))
             .replacingOccurrences(of: "\u{2014}", with: " - ")
             .replacingOccurrences(of: "\u{2013}", with: "-")
@@ -35,10 +33,13 @@ enum NationalTodayExtractor {
             .replacingOccurrences(of: "\u{00A0}", with: " ")
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
-            .replacingOccurrences(of: " [[B]]", with: "[[B]]")
-            .replacingOccurrences(of: "[[/B]] ", with: "[[/B]]")
-        guard !plain.isEmpty else { return nil }
-        return Data(plain.utf8.prefix(BridgeConfiguration.maximumResponseBytes))
+        let normalized = plain.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+        let ascii = normalized.unicodeScalars.filter { (32...126).contains($0.value) }
+            .map(String.init).joined()
+        guard !ascii.replacingOccurrences(of: "[[B]]", with: "")
+            .replacingOccurrences(of: "[[/B]]", with: "")
+            .trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return Data(ascii.utf8.prefix(BridgeConfiguration.maximumResponseBytes))
     }
 
     private static func stripTags(_ input: String) -> String {

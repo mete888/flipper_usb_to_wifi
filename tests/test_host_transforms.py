@@ -39,8 +39,18 @@ class HostTransformTests(unittest.TestCase):
         ).encode()
         self.assertEqual(
             transform_national_today(source),
-            b"[[B]]World Test Day[[/B]]celebrates safety & Mugla - today.",
+            b"[[B]]World Test Day[[/B]] celebrates safety & Mugla - today.",
         )
+
+    def test_national_today_keeps_spaces_between_holidays_and_inline_words(self) -> None:
+        source = b'<div class="single-date-header-content"><p><b>First Day</b> is here. <strong class="day">Next Day</strong> uses pre<b>fix</b>es.</p></div>'
+        self.assertEqual(transform_national_today(source),
+                         b"[[B]]First Day[[/B]] is here. [[B]]Next Day[[/B]] uses pre[[B]]fix[[/B]]es.")
+
+    def test_national_today_rejects_marker_only_paragraphs(self) -> None:
+        for fragment in (b"<b></b>", b"<strong> </strong>"):
+            with self.subTest(fragment=fragment), self.assertRaises(ValueError):
+                transform_national_today(b'<div class="single-date-header-content"><p>' + fragment + b'</p></div>')
 
     def test_radio_browser_keeps_only_small_https_mp3_streams(self) -> None:
         source = b"""[

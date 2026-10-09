@@ -1,6 +1,7 @@
 #include "fib_bridge_client.h"
 
 #include "../../bridge_session.h"
+#include "../../ble_pairing_storage.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,9 @@ static void fib_bridge_copy_status(
     destination->state = fib_bridge_map_state(source->state);
     destination->permission = (FibBridgePermission)source->permission;
     destination->usb_connected = source->usb_connected;
+    destination->connected = source->usb_connected;
+    destination->bluetooth_mode = source->bluetooth_alpha;
+    destination->bluetooth_connected = source->bluetooth_alpha && source->usb_connected;
     destination->host_present = source->helper_present;
     destination->active_request = source->active_request;
     destination->response_truncated = source->response_truncated;
@@ -110,7 +114,57 @@ void fib_bridge_client_free(FibBridgeClient* client) {
 }
 
 bool fib_bridge_client_start(FibBridgeClient* client) {
-    return client && bridge_session_start(client->session);
+    return fib_bridge_client_connect(client, FibBridgeTransportUSB);
+}
+
+bool fib_bridge_client_connect(FibBridgeClient* client, FibBridgeTransport transport) {
+    if(!client) return false;
+    switch(transport) {
+    case FibBridgeTransportNone:
+        return bridge_session_select_transport(client->session, BridgeTransportNone);
+    case FibBridgeTransportUSB:
+        return bridge_session_select_transport(client->session, BridgeTransportUSB);
+    case FibBridgeTransportBluetooth:
+        return bridge_session_select_transport(client->session, BridgeTransportBluetooth);
+    default:
+        return false;
+    }
+}
+
+bool fib_bridge_client_disconnect(FibBridgeClient* client) {
+    return fib_bridge_client_connect(client, FibBridgeTransportNone);
+}
+
+void fib_bridge_client_get_pairing_status(FibBridgeClient* client, FibBridgePairingStatus* status) {
+    if(!status) return;
+    memset(status, 0, sizeof(*status));
+    if(!client) return;
+    BridgeSessionPairingStatus source;
+    bridge_session_get_pairing_status(client->session, &source);
+    status->request_pending = source.request_pending;
+    status->known_computer = source.known_host;
+    status->code_pending = source.code_pending;
+    status->request_nonce = source.request_nonce;
+    memcpy(status->computer_id, source.host_id, sizeof(status->computer_id));
+    memcpy(status->computer_name, source.host_label, sizeof(status->computer_name));
+    status->computer_name[sizeof(status->computer_name) - 1U] = '\0';
+    memcpy(status->code, source.code, sizeof(status->code));
+    status->code[sizeof(status->code) - 1U] = '\0';
+}
+
+bool fib_bridge_client_respond_to_computer(FibBridgeClient* client, uint64_t nonce, bool allow) {
+    return client && bridge_session_respond_bluetooth_request(client->session, nonce, allow);
+}
+
+size_t fib_bridge_client_known_computers(
+    FibBridgeClient* client, uint8_t (*ids)[16], size_t capacity, size_t offset, bool* more) {
+    if(more) *more = false;
+    if(!client || !ids || !capacity || capacity > FIB_BRIDGE_KNOWN_COMPUTER_PAGE_SIZE) return 0U;
+    return fib_pair_storage_list(ids, capacity, offset, more);
+}
+
+bool fib_bridge_client_revoke_computer(FibBridgeClient* client, const uint8_t id[16]) {
+    return client && id && bridge_session_revoke_bluetooth_host(client->session, id);
 }
 
 void fib_bridge_client_tick(FibBridgeClient* client) {
@@ -133,7 +187,10 @@ bool fib_bridge_client_is_ready(FibBridgeClient* client) {
     if(!client) return false;
     BridgeSessionStatus snapshot;
     bridge_session_get_status(client->session, &snapshot);
-    return snapshot.state == BridgeSessionStateReady || snapshot.state == BridgeSessionStateComplete;
+    return (snapshot.state == BridgeSessionStateReady || snapshot.state == BridgeSessionStateComplete) &&
+        snapshot.usb_connected && snapshot.helper_present && snapshot.selected_major != 0U &&
+        (snapshot.permission == BridgePermissionAllowedOnce ||
+         snapshot.permission == BridgePermissionAllowedAlways);
 }
 
 bool fib_bridge_client_has_active_request(FibBridgeClient* client) {

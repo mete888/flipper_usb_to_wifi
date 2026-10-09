@@ -34,6 +34,7 @@ MAX_APP_VERSION_BYTES = 16
 MAX_ERROR_DETAIL_BYTES = 128
 MAX_REQUEST_BODY_BYTES = 4096
 MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
+MAX_RADIO_RESPONSE_BODY_BYTES = 64 * 1024 * 1024
 MAX_HEADER_COUNT = 8
 
 _HEADER_PREFIX = struct.Struct("<4sBBBBHHIII")
@@ -74,6 +75,7 @@ class Capability(IntFlag):
     REQUEST_HEADERS = 0x00000004
     RESPONSE_HEADERS = 0x00000008
     CANCELLATION = 0x00000010
+    USB_RADIO_PCM = 0x00000400
 
 
 class ErrorCode(IntEnum):
@@ -469,7 +471,8 @@ def encode_hello(value: Hello) -> bytes:
     _require_uint("capabilities", int(value.capabilities), 32)
     if not MIN_NEGOTIATED_PAYLOAD <= value.maximum_rx_payload <= MAX_FRAME_PAYLOAD:
         raise ValueError("maximum_rx_payload is outside v1 bounds")
-    if not 1 <= value.maximum_response_bytes <= MAX_RESPONSE_BODY_BYTES:
+    limit = MAX_RADIO_RESPONSE_BODY_BYTES if value.capabilities & Capability.USB_RADIO_PCM else MAX_RESPONSE_BODY_BYTES
+    if not 1 <= value.maximum_response_bytes <= limit:
         raise ValueError("maximum_response_bytes is outside v1 bounds")
     _require_uint("client_nonce", value.client_nonce, 64)
     _require_uint("id_type", value.id_type, 8)
@@ -533,7 +536,8 @@ def decode_hello(payload: bytes) -> Hello:
     reader.done()
     if not MIN_NEGOTIATED_PAYLOAD <= maximum_rx_payload <= MAX_FRAME_PAYLOAD:
         raise PayloadDecodeError("maximum_rx_payload is outside v1 bounds")
-    if not 1 <= maximum_response_bytes <= MAX_RESPONSE_BODY_BYTES:
+    limit = MAX_RADIO_RESPONSE_BODY_BYTES if capabilities & Capability.USB_RADIO_PCM else MAX_RESPONSE_BODY_BYTES
+    if not 1 <= maximum_response_bytes <= limit:
         raise PayloadDecodeError("maximum_response_bytes is outside v1 bounds")
     return Hello(
         minimum_major,
@@ -569,7 +573,8 @@ def encode_hello_ack(value: HelloAck) -> bytes:
     _require_uint("capabilities", int(value.capabilities), 32)
     if not MIN_NEGOTIATED_PAYLOAD <= value.maximum_payload <= MAX_FRAME_PAYLOAD:
         raise ValueError("maximum_payload is outside v1 bounds")
-    if not 1 <= value.maximum_response_bytes <= MAX_RESPONSE_BODY_BYTES:
+    limit = MAX_RADIO_RESPONSE_BODY_BYTES if value.capabilities & Capability.USB_RADIO_PCM else MAX_RESPONSE_BODY_BYTES
+    if not 1 <= value.maximum_response_bytes <= limit:
         raise ValueError("maximum_response_bytes is outside v1 bounds")
     _require_uint("echoed_client_nonce", value.echoed_client_nonce, 64)
     _require_uint("server_nonce", value.server_nonce, 64)
@@ -591,7 +596,8 @@ def decode_hello_ack(payload: bytes) -> HelloAck:
     value = HelloAck(*struct.unpack("<BBIHIQQ", payload))
     if not MIN_NEGOTIATED_PAYLOAD <= value.maximum_payload <= MAX_FRAME_PAYLOAD:
         raise PayloadDecodeError("maximum_payload is outside v1 bounds")
-    if not 1 <= value.maximum_response_bytes <= MAX_RESPONSE_BODY_BYTES:
+    limit = MAX_RADIO_RESPONSE_BODY_BYTES if value.capabilities & Capability.USB_RADIO_PCM else MAX_RESPONSE_BODY_BYTES
+    if not 1 <= value.maximum_response_bytes <= limit:
         raise PayloadDecodeError("maximum_response_bytes is outside v1 bounds")
     return value
 
@@ -739,20 +745,20 @@ class ResponseEnd:
     bytes_sent: int
 
 
-def encode_response_end(value: ResponseEnd) -> bytes:
+def encode_response_end(value: ResponseEnd, maximum_bytes: int = MAX_RESPONSE_BODY_BYTES) -> bytes:
     if value.result not in (0, 1, 2):
         raise ValueError("response result must be complete, truncated, or cancelled")
-    if not 0 <= value.bytes_sent <= MAX_RESPONSE_BODY_BYTES:
+    if not 0 <= value.bytes_sent <= min(maximum_bytes, MAX_RADIO_RESPONSE_BODY_BYTES):
         raise ValueError("bytes_sent exceeds v1 limit")
     return struct.pack("<BI", value.result, value.bytes_sent)
 
 
-def decode_response_end(payload: bytes) -> ResponseEnd:
+def decode_response_end(payload: bytes, maximum_bytes: int = MAX_RESPONSE_BODY_BYTES) -> ResponseEnd:
     if len(payload) != struct.calcsize("<BI"):
         raise PayloadDecodeError("RESPONSE_END has the wrong length")
     value = ResponseEnd(*struct.unpack("<BI", payload))
     try:
-        encode_response_end(value)
+        encode_response_end(value, maximum_bytes)
     except ValueError as error:
         raise PayloadDecodeError(str(error)) from error
     return value

@@ -1,0 +1,4 @@
+include host/radio_decoder/decoder.h
+include third_party/minimp3/minimp3.h
+include host/THIRD_PARTY_DESKTOP.md
+recursive-include host/assets *.png *.ico

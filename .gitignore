@@ -8,9 +8,13 @@
 **/.swiftpm/
 **/__pycache__/
 *.pyc
+*.so
+*.pyd
 *.egg-info/
 DerivedData/
 build/
 *.spec
 .vscode/compile_commands.json
 dist/debug/
+dist/macos/Build.noindex/
+dist/host-desktop/

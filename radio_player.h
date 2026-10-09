@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 typedef struct RadioPlayer RadioPlayer;
+size_t radio_player_required_heap(void);
 
 RadioPlayer* radio_player_alloc(void);
 void radio_player_free(RadioPlayer* player);
@@ -16,3 +17,5 @@ bool radio_player_is_running(const RadioPlayer* player);
 uint32_t radio_player_decoded_frames(const RadioPlayer* player);
 size_t radio_player_buffered_bytes(RadioPlayer* player);
 uint32_t radio_player_underflows(const RadioPlayer* player);
+
+const char* radio_player_error(const RadioPlayer* player);

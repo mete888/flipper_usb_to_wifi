@@ -7,6 +7,7 @@ import unicodedata
 from urllib.parse import urlsplit
 
 from scripts.fibp_codec import RequestStart
+from . import toolbox
 
 NATIONAL_TODAY = "national_today"
 RADIO_BROWSER = "radio_browser"
@@ -21,10 +22,12 @@ def transform_for(request: RequestStart) -> str | None:
         return NATIONAL_TODAY
     if host == "all.api.radio-browser.info" and parts.path == "/json/stations/search":
         return RADIO_BROWSER
-    return None
+    return toolbox.kind_for(request.url)
 
 
 def maximum_source_bytes(kind: str) -> int:
+    if kind in {toolbox.EARTHQUAKES, toolbox.DICTIONARY, toolbox.CURRENCY}:
+        return toolbox.MAXIMUM_SOURCE_BYTES
     return 256 * 1024 if kind == NATIONAL_TODAY else 128 * 1024
 
 
@@ -62,8 +65,8 @@ def transform_national_today(data: bytes) -> bytes:
     fragment = re.sub(r"<[^>]*>", "", fragment)
     plain = _ascii(html.unescape(fragment))
     plain = " ".join(plain.split())
-    plain = plain.replace(" [[B]]", "[[B]]").replace("[[/B]] ", "[[/B]]")
-    if not plain:
+    # Tags are formatting only: preserve the publisher's word/sentence spaces.
+    if not plain.replace("[[B]]", "").replace("[[/B]]", "").strip():
         raise ValueError("National Today paragraph was empty")
     return plain.encode("ascii")
 
@@ -73,7 +76,7 @@ def _field(value: object, fallback: str, limit: int) -> str:
     return _ascii(text).replace("\t", " ").replace("\r", " ").replace("\n", " ")[:limit]
 
 
-def transform_radio_browser(data: bytes) -> bytes:
+def transform_radio_browser(data: bytes, maximum_bitrate: int = 64) -> bytes:
     decoded = json.loads(data.decode("utf-8", errors="strict"))
     if not isinstance(decoded, list):
         raise ValueError("Radio Browser response is not an array")  # noqa: TRY004
@@ -88,7 +91,7 @@ def transform_radio_browser(data: bytes) -> bytes:
             continue
         if not isinstance(codec, str) or codec.lower() != "mp3":
             continue
-        if not isinstance(bitrate, (int, float)) or not 8 <= int(bitrate) <= 64:
+        if not isinstance(bitrate, (int, float)) or not 8 <= int(bitrate) <= min(64, maximum_bitrate):
             continue
         lines.append(
             "\t".join(
@@ -104,9 +107,11 @@ def transform_radio_browser(data: bytes) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def apply_transform(kind: str, data: bytes) -> bytes:
+def apply_transform(kind: str, data: bytes, maximum_radio_bitrate: int = 64) -> bytes:
     if kind == NATIONAL_TODAY:
         return transform_national_today(data)
     if kind == RADIO_BROWSER:
-        return transform_radio_browser(data)
+        return transform_radio_browser(data, maximum_radio_bitrate)
+    if kind in {toolbox.EARTHQUAKES, toolbox.DICTIONARY, toolbox.CURRENCY}:
+        return toolbox.extract(kind, data)
     raise ValueError("unknown response transform")

@@ -32,6 +32,8 @@ public final class BridgeCoordinator: @unchecked Sendable {
     private let idleSessionTimeout: TimeInterval
     private let pongTimeout: TimeInterval
     private let requestAssemblyTimeout: TimeInterval
+    private let allowPersistentPermissions: Bool
+    private let maximumResponseBytes: Int
     public let diagnostics: DiagnosticsLog
 
     private let queue = DispatchQueue(label: "fibp.bridge-session", qos: .userInitiated)
@@ -76,7 +78,9 @@ public final class BridgeCoordinator: @unchecked Sendable {
         diagnostics: DiagnosticsLog = DiagnosticsLog(),
         idleSessionTimeout: TimeInterval = BridgeConfiguration.idleSessionTimeout,
         pongTimeout: TimeInterval = BridgeConfiguration.pongTimeout,
-        requestAssemblyTimeout: TimeInterval = BridgeConfiguration.requestAssemblyTimeout
+        requestAssemblyTimeout: TimeInterval = BridgeConfiguration.requestAssemblyTimeout,
+        allowPersistentPermissions: Bool = true,
+        maximumResponseBytes: Int = BridgeConfiguration.maximumResponseBytes
     ) {
         self.monitor = monitor
         self.transport = transport
@@ -87,6 +91,8 @@ public final class BridgeCoordinator: @unchecked Sendable {
         self.idleSessionTimeout = idleSessionTimeout
         self.pongTimeout = pongTimeout
         self.requestAssemblyTimeout = requestAssemblyTimeout
+        self.allowPersistentPermissions = allowPersistentPermissions
+        self.maximumResponseBytes = max(1, min(maximumResponseBytes, BridgeConfiguration.maximumResponseBytes))
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -142,6 +148,12 @@ public final class BridgeCoordinator: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, let identity = self.identity, self.currentDevice != nil else { return }
             self.permissionPrompt.cancelPendingPrompt()
+            if !self.allowPersistentPermissions {
+                self.permission = .allowedOnce
+                self.sendPermissionStatus(.allowedOnce, reason: 0)
+                self.transition(.ready, "Bluetooth: access allowed for this connection")
+                return
+            }
             self.permissions.grant(identity)
             self.permission = .alwaysAllowed
             self.sendPermissionStatus(.alwaysAllowed, reason: 0)
@@ -176,7 +188,8 @@ public final class BridgeCoordinator: @unchecked Sendable {
         candidates[device.registryID] = device
         diagnostics.append(
             .info,
-            "Flipper serial candidate found: \(device.calloutPath), interface \(device.interfaceNumber.map(String.init) ?? "unknown")."
+            device.linkKind == .bluetoothAlpha ? "Bluetooth Alpha candidate found." :
+                "Flipper serial candidate found: \(device.calloutPath), interface \(device.interfaceNumber.map(String.init) ?? "unknown")."
         )
         attemptNextCandidateIfNeeded()
     }
@@ -185,7 +198,7 @@ public final class BridgeCoordinator: @unchecked Sendable {
         candidates.removeValue(forKey: device.registryID)
         attemptedCandidateIDs.remove(device.registryID)
         guard currentDevice?.registryID == device.registryID else { return }
-        diagnostics.append(.warning, "USB serial connection was removed.")
+        diagnostics.append(.warning, "Bridge transport connection was removed.")
         cancelCurrentConnection(closeTransport: true)
         transition(.disconnected, "Disconnected")
         attemptNextCandidateIfNeeded()
@@ -231,15 +244,18 @@ public final class BridgeCoordinator: @unchecked Sendable {
                 self.attemptNextCandidateIfNeeded()
             }
         }
-        transition(.openingSerial, "Opening USB serial connection")
+        transition(.openingSerial, candidate.linkKind == .bluetoothAlpha ?
+            "Opening Bluetooth Alpha connection" : "Opening USB serial connection")
         do {
             try transport.open(device: candidate)
             lastActivity = Date()
             helloDeadline = Date().addingTimeInterval(BridgeConfiguration.handshakeTimeout)
             transition(.waitingForHello, "Waiting for Flipper HELLO")
-            diagnostics.append(.info, "Serial connection opened: \(candidate.calloutPath).")
+            diagnostics.append(.info, candidate.linkKind == .bluetoothAlpha ?
+                "Bluetooth Alpha channel opened." : "Serial connection opened: \(candidate.calloutPath).")
         } catch {
-            diagnostics.append(.warning, "Serial candidate could not be opened: \(candidate.calloutPath).")
+            diagnostics.append(.warning, candidate.linkKind == .bluetoothAlpha ?
+                "Bluetooth Alpha channel could not be opened." : "Serial candidate could not be opened: \(candidate.calloutPath).")
             currentDevice = nil
             transport.onReceive = nil
             transport.onDisconnect = nil
@@ -393,14 +409,20 @@ public final class BridgeCoordinator: @unchecked Sendable {
         nextServerControlSequence = 1
         permissionReplayFrames.removeAll(keepingCapacity: true)
         negotiatedPayload = min(Int(decoded.maximumReceivePayload), BridgeConfiguration.maximumWirePayload)
-        negotiatedResponseBytes = min(Int(decoded.maximumResponseBytes), BridgeConfiguration.maximumResponseBytes)
+        let radioBudget = decoded.capabilities.contains(.usbRadioPCM) &&
+            maximumResponseBytes == BridgeConfiguration.maximumResponseBytes ?
+            BridgeConfiguration.maximumRadioResponseBytes : maximumResponseBytes
+        negotiatedResponseBytes = min(Int(decoded.maximumResponseBytes), radioBudget)
+        if currentDevice?.linkKind == .bluetoothAlpha {
+            negotiatedResponseBytes = min(negotiatedResponseBytes, BridgeConfiguration.bluetoothTextResponseBytes)
+        }
         negotiatedCapabilities = decoded.capabilities.intersection(.helperSupported)
         serverNonce = UInt64.random(in: 1...UInt64.max)
         sendHelloAcknowledgment(decoded)
 
         guard let identity else { return }
         diagnostics.append(.info, "FIBP HELLO validated: \(identity.displayName), \(identity.redactedID).")
-        if permissions.contains(identity) {
+        if allowPersistentPermissions && permissions.contains(identity) {
             permission = .alwaysAllowed
             sendPermissionStatus(.alwaysAllowed, reason: 1)
             transition(.ready, "Internet access ready")
@@ -462,6 +484,12 @@ public final class BridgeCoordinator: @unchecked Sendable {
             sendPermissionStatus(.allowedOnce, reason: 0)
             transition(.ready, "Internet access ready")
         case .alwaysAllow:
+            if !allowPersistentPermissions {
+                permission = .allowedOnce
+                sendPermissionStatus(.allowedOnce, reason: 0)
+                transition(.ready, "Bluetooth: access allowed for this connection")
+                return
+            }
             permissions.grant(identity)
             permission = .alwaysAllowed
             sendPermissionStatus(.alwaysAllowed, reason: 0)
@@ -562,6 +590,11 @@ public final class BridgeCoordinator: @unchecked Sendable {
         }
         do {
             let start = try FIBPRequestStart(payload: frame.payload)
+            if currentDevice?.linkKind == .bluetoothAlpha && start.method != .get {
+                sendError(.invalidRequest, scope: 1, requestID: frame.requestID,
+                          offendingType: frame.rawMessageType, detail: "Bluetooth Alpha supports GET only")
+                return
+            }
             guard start.method != .post || negotiatedCapabilities.contains(.httpsPOST),
                   start.declaredHeaderCount == 0 || negotiatedCapabilities.contains(.requestHeaders) else {
                 sendError(.invalidRequest, scope: 1, requestID: frame.requestID,
@@ -587,6 +620,12 @@ public final class BridgeCoordinator: @unchecked Sendable {
         guard var request = activeRequest else { return }
         do {
             let header = try BridgeHTTPHeader(payload: frame.payload)
+            if currentDevice?.linkKind == .bluetoothAlpha &&
+                header.name.caseInsensitiveCompare("accept") == .orderedSame &&
+                header.value.lowercased().contains("audio/mpeg") {
+                abortRequest(frame, code: .invalidRequest, detail: "Internet radio requires USB")
+                return
+            }
             let aggregate = request.aggregateHeaderBytes + header.name.utf8.count + header.value.utf8.count
             guard !request.bodyStarted,
                   request.headers.count < Int(request.start.declaredHeaderCount),
@@ -638,13 +677,23 @@ public final class BridgeCoordinator: @unchecked Sendable {
             return
         }
         transition(.performingRequest, "Performing HTTPS request")
+        let bluetooth = currentDevice?.linkKind == .bluetoothAlpha
+        let usbRadioPCM = request.headers.contains {
+            $0.name.lowercased() == "accept" && $0.value == "audio/mpeg; fib-pcm=14493"
+        }
+        if bluetooth && request.headers.contains(where: { $0.name.lowercased() == "accept" && $0.value.lowercased().contains("audio/") }) {
+            abortRequest(frame, code: .invalidRequest, detail: "Internet radio requires USB")
+            return
+        }
         let networkRequest = BridgeHTTPRequest(
             requestID: request.requestID,
             method: request.start.method,
             urlString: request.start.url,
             headers: request.headers,
             body: request.body,
-            timeout: TimeInterval(request.start.timeoutMilliseconds) / 1_000
+            timeout: TimeInterval(request.start.timeoutMilliseconds) / 1_000,
+            bluetooth: bluetooth,
+            maximumResponseBytes: responseLimit(for: request)
         )
         let token = connectionToken
         httpClient.execute(
@@ -656,9 +705,22 @@ public final class BridgeCoordinator: @unchecked Sendable {
                 }
             },
             onData: { [weak self] data in
-                self?.queue.async {
-                    guard self?.connectionToken == token else { return }
-                    self?.networkData(data, requestID: request.requestID)
+                guard let self else { return }
+                if bluetooth || usbRadioPCM {
+                    // Backpressure reaches the network drain; audio closures
+                    // cannot accumulate while BLE acknowledgements or USB PCM
+                    // endpoint backpressure delay the writer.
+                    let deliver = {
+                        guard self.connectionToken == token else { return }
+                        self.networkData(data, requestID: request.requestID)
+                    }
+                    if DispatchQueue.getSpecific(key: self.queueKey) != nil { deliver() }
+                    else { self.queue.sync(execute: deliver) }
+                } else {
+                    self.queue.async {
+                        guard self.connectionToken == token else { return }
+                        self.networkData(data, requestID: request.requestID)
+                    }
                 }
             },
             completion: { [weak self] result in
@@ -726,6 +788,16 @@ public final class BridgeCoordinator: @unchecked Sendable {
 
     // MARK: - Response stream
 
+    private func responseLimit(for request: IncomingRequest) -> Int {
+        if currentDevice?.linkKind == .bluetoothAlpha {
+            return min(negotiatedResponseBytes, BridgeConfiguration.bluetoothTextResponseBytes)
+        }
+        let pcm = request.headers.contains {
+            $0.name.lowercased() == "accept" && $0.value.lowercased() == "audio/mpeg; fib-pcm=14493"
+        }
+        return min(negotiatedResponseBytes, pcm ? BridgeConfiguration.maximumRadioResponseBytes : maximumResponseBytes)
+    }
+
     private func networkResponseStarted(_ metadata: BridgeHTTPResponseMetadata, requestID: UInt32) {
         guard var request = activeRequest, request.requestID == requestID,
               !request.responseStarted, canPerformNetworkRequest else { return }
@@ -738,7 +810,7 @@ public final class BridgeCoordinator: @unchecked Sendable {
         }
         let declaredLength: UInt32
         if metadata.expectedBodyLength >= 0,
-           metadata.expectedBodyLength <= Int64(negotiatedResponseBytes) {
+           metadata.expectedBodyLength <= Int64(responseLimit(for: request)) {
             declaredLength = UInt32(metadata.expectedBodyLength)
         } else {
             declaredLength = UInt32.max
@@ -762,7 +834,7 @@ public final class BridgeCoordinator: @unchecked Sendable {
     private func networkData(_ data: Data, requestID: UInt32) {
         guard var request = activeRequest, request.requestID == requestID,
               request.responseStarted, !request.responseEnded, canPerformNetworkRequest else { return }
-        let remaining = negotiatedResponseBytes - request.responseBytes
+        let remaining = responseLimit(for: request) - request.responseBytes
         if remaining > 0 {
             let accepted = data.prefix(remaining)
             let chunkSize = max(1, min(BridgeConfiguration.responseChunkSize, negotiatedPayload))

@@ -18,6 +18,8 @@ public enum BridgeConfiguration {
     public static let maximumAggregateRequestHeaderBytes = 1_024
     public static let maximumRequestBodyBytes = 4 * 1_024
     public static let maximumResponseBytes = 4 * 1_024 * 1_024
+    public static let maximumRadioResponseBytes = 64 * 1_024 * 1_024
+    public static let bluetoothTextResponseBytes = 8 * 1_024
     public static let maximumRedirects = 3
     public static let defaultRequestTimeoutMilliseconds: UInt32 = 25_000
     public static let maximumRequestTimeoutMilliseconds: UInt32 = 30_000
@@ -29,11 +31,10 @@ public enum BridgeConfiguration {
     public static let maximumErrorDetailBytes = 128
     // HELLO_ACK is the largest mandatory pre-negotiation payload (28 bytes).
     public static let minimumAdvertisedReceivePayload = 28
-    public static let fixedUserAgent = "FlipperUSBInternetBridge/0.3"
+    public static let fixedUserAgent = "FlipperUSBInternetBridge/0.5"
     // USB CDC ignores the nominal baud rate and can otherwise overrun Flipper's
     // small receive queue when a server delivers a large body in one burst.
     public static let serialWriteChunkSize = 64
-    public static let serialWritePacingMicroseconds: UInt32 = 1_000
 
     public static let flipperVendorID: UInt16 = 0x0483
     public static let flipperProductID: UInt16 = 0x5740

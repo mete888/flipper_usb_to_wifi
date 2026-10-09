@@ -1,6 +1,6 @@
-# Flipper USB Internet Bridge
+# Internet Bridge
 
-Flipper USB Internet Bridge lets a Flipper Zero make explicitly authorized,
+Internet Bridge lets a Flipper Zero make explicitly authorized,
 restricted HTTPS requests through a desktop computer's existing internet
 connection. The Flipper does not join Wi-Fi. A desktop host acts as a
 user-space application proxy.
@@ -8,7 +8,7 @@ user-space application proxy.
 ```text
 Flipper Zero FAP
       ↕  FIBP v1 binary frames
-USB CDC ACM — second CDC channel only
+USB CDC ACM (second channel) OR Bluetooth GATT
       ↕
 desktop host
 (native macOS app or Windows/Linux/macOS CLI)
@@ -25,6 +25,7 @@ outside the MVP.
 - Standard Flipper SDK/uFBT `.fap` application
 - Native Swift and SwiftUI macOS 13+ menu bar helper
 - Installable Windows/Linux/macOS command-line host
+- Optional compact Windows/Linux graphical helper with USB/Bluetooth tabs
 - Source-level client SDK that other Flipper FAPs can compile into their apps
 - Versioned binary protocol with explicit frame boundaries and two CRC32 checks
 - Device- and protocol-bound one-time or persistent permission
@@ -36,6 +37,15 @@ outside the MVP.
 - Portable C/Python tests and Swift unit/integration tests
 
 ## Flipper menu
+
+Find **Internet Bridge** under **Apps → Tools**. Desktop helpers retain the
+**Flipper Internet Bridge** name. The category is shared
+by both connection modes; the application ID and FAP filename remain unchanged.
+This describes version 0.5.0. Apps Catalog updates become available after the
+maintainers approve and merge the version's submission.
+See [0.5.0 release checks and remaining hardware limits](docs/release-validation-0.5.0.md).
+
+First choose USB Internet Bridge or Bluetooth Internet Bridge. Their shared menu:
 
 - **Test Connection** — sends a PING and waits for PONG
 - **Get Sample Text** — fetches and displays a short message
@@ -49,12 +59,47 @@ outside the MVP.
   - **Markets** — searches any Binance Spot coin with a USDT pair, shows gold and
     silver in USD per troy ounce, and gets Brent BZ/USDT from Binance Futures.
     Open price cards refresh silently every two seconds.
+  - **Latest Earthquakes** — shows the ten newest earthquake events reported
+    by USGS, with magnitude, location, UTC time, depth, and manual refresh
+  - **Currency Converter** — choose source and target currency from a list,
+    enter an amount, and view the converted value and reference-rate date
+  - **English Dictionary** — look up one English word and read up to three
+    meanings with examples where available
 - **Custom URL Request** — accepts an HTTPS URL up to 384 bytes
 - **Connection Info** — shows USB, helper, permission, device, and protocol state
+- **Bluetooth only: Connection Requests / Pairings** — explicitly choose a
+  discovered bridge computer before Pair/Connect. Known Computers can revoke a
+  bridge credential without changing USB permissions or system Bluetooth bonds.
+
+On launch, choose **USB Internet Bridge** or **Bluetooth Internet Bridge**.
+Back from either mode's main menu ends that connection and returns to this
+selector; Back again exits the FAP. No bridge transport starts before selection.
+USB includes all nine Toolbox tools. Bluetooth includes the same text tools but
+not Internet Radio. Its radio experiment remains removed.
+
+The native Mac menu bar panel has compact **USB / Bluetooth** tabs and independent
+enable switches. Changing the selected tab does not stop either connection.
+USB monitoring starts automatically; Bluetooth starts only when enabled.
+Each transport owns its coordinator, HTTP client, consent prompt and active
+request. USB retains Allow Once / Always Allow / Deny; Bluetooth always requires
+fresh Allow Once / Deny after code-based recognition. Pairing is not consent.
+See [connection architecture](docs/connection-modes.md) for setup and limits.
+
+USB radio uses host-side MP3 decoding with the same minimp3/resampler, streaming
+16-bit mono 14,493 Hz PCM to the original Flipper speaker/DSP. Both the FAP and
+desktop helper must be updated together. No FFmpeg is required.
+Windows/Linux terminal hosts keep their existing USB and opt-in Bluetooth
+commands. The optional Qt graphical helper follows the same compact two-tab
+layout; see [Windows and Linux hosts](#run-the-windowslinux-host).
 
 The sample text is displayed only; it is not saved to the microSD card. Response
-bodies arrive in 192-byte protocol chunks. The Flipper retains only a bounded
-1,536-byte screen preview, while the total response limit is 4 MiB.
+bodies arrive in 192-byte protocol chunks. Ordinary requests retain only a bounded
+1,536-byte screen preview and a 4 MiB total response limit. Negotiated USB radio
+uses separate bounded 64 MiB audio segments, a 16 KiB speaker ring on Flipper,
+and approximately ten seconds of prebuffering on the desktop. USB endpoint
+backpressure prevents dropped packets; the Mac pauses the network source when
+its bounded reservoir fills. Stop and physical Back silence the speaker and
+cancel the request. No response is loaded in full into Flipper RAM.
 
 Weather searches accept ASCII input. Open-Meteo performs case- and
 diacritic-insensitive matching and returns at most three choices. The result
@@ -65,9 +110,85 @@ by this feature.
 The National Today page is too large for the Flipper. Each desktop host therefore
 downloads it into a bounded temporary buffer, extracts only the
 `single-date-header-content` paragraph, removes HTML, and sends the compact text
-to the Flipper. Bold holiday names are rendered as bold heading lines. If the
+to the Flipper. Holiday names retain inline bold formatting and spaces around
+them. The reader shows four body lines without an extra subtitle, wraps long
+names using real glyph advances, and scrolls with the arrows. OK refreshes the
+live page; Back returns to Toolbox. Text is converted to printable ASCII.
+Responses larger than the 1,536-byte preview explicitly show **[Text shortened]**
+instead of silently appearing complete; the preview buffer is not enlarged. If the
 site changes its HTML structure, the app reports a parsing error instead of
 returning unrelated page content.
+
+## Interface updates (0.5.0)
+
+- **Wikipedia:** padded ASCII text reader with a separate search heading;
+  Up/Down scrolls, Left/Right moves further through the text, and OK opens a new
+  search. No encyclopedia tagline or divider consumes the reading area.
+- **Weather:** a location, temperature and condition page plus a second page
+  for apparent temperature, humidity, wind and rain probability. The small icon
+  reflects the weather condition. Arrows switch pages and OK refreshes.
+- **Where is the ISS?:** one page for latitude/longitude and another for
+  altitude/speed. Arrows switch pages and OK refreshes.
+- **National Today:** four-line live reader with inline bold holiday names,
+  corrected spacing/wrapping and an explicit shortened-text notice when needed.
+- **Desktop:** the native macOS panel and optional Windows/Linux GUI use compact
+  USB/Bluetooth tabs, separate connection controls, Pairings and Diagnostics.
+  CLI commands remain available. GUI previews are actual Qt widget captures on
+  macOS, not proof of Windows/Linux hardware validation.
+
+See the [UI validation report](docs/test-results-2026-10-08-ui.md) and
+[National Today follow-up](docs/test-results-2026-10-08-national-today.md) for
+build/test evidence and the remaining hardware checks.
+
+## New Toolbox tools (0.5.0)
+
+Use a matching **0.5.0 or newer desktop helper** for the new tools. Both the
+native macOS app and Windows/Linux host include the transformations. An older
+helper produces an update message rather than dumping raw JSON onto the screen.
+
+**Latest Earthquakes:** open the tool and browse the ten newest event cards
+in the [USGS earthquake catalog](https://earthquake.usgs.gov/fdsnws/event/1/).
+Use Left/Right to change events, Up/Down to read a long location and OK to
+refresh. Magnitude and depth have separate padded fields; the location sits in
+a full-width card with a small scrolling indicator, and time stays below it.
+Times are UTC; USGS coverage is not an
+exhaustive list of every local earthquake. The query filters out non-earthquake
+events and orders by occurrence time, not magnitude or the last update time.
+
+**Currency Converter:** one screen has two currency selectors and two amount
+fields. Use the arrows to highlight a field, then OK to edit it. Either amount
+is editable: the last edited side drives the conversion of the opposite side.
+Both selectors offer USD, EUR, GBP, TRY, JPY, CHF,
+CAD, AUD, CNY, INR, BRL, MXN, SEK, NOK, PLN, KRW, HKD, SGD, NZD, DKK, and ZAR.
+The 21 options cover major international currencies and selected regional
+currencies; this is not every world currency or a trading-volume ranking.
+Amounts support up to nine
+whole digits and two decimal places. Results are displayed with two decimals;
+Back from an editor or selector returns to the converter; Back from the
+converter returns to Toolbox. Switching currencies clears the stale rate
+before fetching the new pair. Editing an amount reuses the fetched rate.
+[Frankfurter v2](https://frankfurter.dev/)
+provides reference exchange rates; the result shows the observation date.
+These are reference values, not live trading or bank transaction quotes.
+
+**English Dictionary:** enter one word using ASCII letters, a hyphen, or an
+apostrophe (1–48 characters). The [Free Dictionary API](https://dictionaryapi.dev/)
+returns definitions; the helper sends up to three meanings, with an example
+where supplied. Plain word and part-of-speech headings are separate from the
+definition area in a single padded reader panel. A quiet progress rail appears
+only when the text needs scrolling; there is no permanent control legend. Left/Right
+changes meanings (the last page contains source and
+license); Up/Down scrolls the current meaning; OK opens a new word search.
+A 404 becomes **Word not found**. Text is shortened and converted
+to ASCII. The screen retains the entry's source link, license name and link,
+and adaptation notice. Dictionary content retains its original provider/content
+license (commonly Wiktionary CC BY-SA); the project's MIT code license does not
+replace the content license. No audio pronunciations are downloaded.
+
+All three tools keep the existing permission, HTTPS, SSRF, timeout, and
+cancellation rules. Their source JSON is capped at 64 KiB on the desktop and
+their display payload at 1,400 bytes. Back cancels active requests. Oversized or
+malformed provider data is reported as an error, not displayed as partial data.
 
 ## Repository layout
 
@@ -161,18 +282,13 @@ and POSIX APIs. The simulator uses only the Python standard library.
 
 ## Build the Flipper FAP
 
-From the repository directory:
+On a new machine, clone the source and create an isolated uFBT environment.
+The GitHub repository already contains the application at its root; no nested
+project directories are needed:
 
 ```sh
-cd usbtowifi_flipperapp/Flipper-USB-Internet-Bridge
-../../venv/bin/ufbt update --channel release
-../../venv/bin/ufbt
-```
-
-On a new machine, create an isolated uFBT environment:
-
-```sh
-cd usbtowifi_flipperapp/Flipper-USB-Internet-Bridge
+git clone https://github.com/mete888/flipper_usb_to_wifi.git
+cd flipper_usb_to_wifi
 python3 -m venv .ufbt-venv
 ./.ufbt-venv/bin/python -m pip install --upgrade ufbt
 ./.ufbt-venv/bin/ufbt update --channel release
@@ -183,13 +299,15 @@ The output is `dist/usb_internet_bridge.fap`. With one Flipper connected, build,
 install, and launch it with:
 
 ```sh
-../../venv/bin/ufbt launch
+./.ufbt-venv/bin/ufbt launch
 ```
 
 Switching to dual CDC causes USB re-enumeration, so `ufbt launch` may report a
 late serial read error even when the FAP has reached the Flipper. The most
 deterministic installation method is qFlipper's File Manager: copy the FAP to
-`/ext/apps/USB/` and launch it from the device.
+`/ext/apps/Tools/` and launch it from the device. When upgrading an older USB
+installation, move or remove its old `/ext/apps/USB/usb_internet_bridge.fap`
+after the Tools copy is installed; keeping both creates duplicate menu entries.
 
 ## Build the macOS helper
 
@@ -222,14 +340,16 @@ Flipper internet access.
 
 ## Run the Windows/Linux host
 
-The same CLI also runs on macOS as an alternative to the native menu bar app.
+The compact graphical host matches the macOS panel's USB / Bluetooth layout,
+with independent connections, explicit consent, bridge Pairings and Diagnostics.
+The optional CLI also runs on macOS as an alternative to the native menu bar app.
 From the repository root:
 
 ```sh
 python3 -m venv .host-venv
 . .host-venv/bin/activate
-python -m pip install .
-fib-bridge
+python -m pip install ".[desktop]"
+fib-bridge-desktop
 ```
 
 Windows PowerShell activation and startup:
@@ -237,14 +357,14 @@ Windows PowerShell activation and startup:
 ```powershell
 python -m venv .host-venv
 .host-venv\Scripts\Activate.ps1
-python -m pip install .
-fib-bridge
+python -m pip install ".[desktop]"
+fib-bridge-desktop
 ```
 
-Use `fib-bridge --list-ports` to inspect detection or `fib-bridge --port PORT`
-to select a port explicitly. The first device connection asks for Deny, Allow
-Once, or Always Allow in the terminal. See [host/README.md](host/README.md) for
-prebuilt binaries, security, and packaging details.
+The GUI opens explicit code/consent dialogs; USB and Bluetooth never share
+internet grants. Use `fib-bridge --list-ports` / `fib-bridge --port PORT` for the
+retained CLI. See [host/README.md](host/README.md) for platform requirements,
+preview images, security, packaging commands and current validation limits.
 
 ## Use the bridge from another Flipper app
 
@@ -252,8 +372,14 @@ Flipper OS does not keep one FAP running as a background service while another
 FAP is open. Consumer apps therefore compile the small source SDK into their own
 FAP and talk directly to the desktop host:
 
+1. Export the SDK with
+   `python3 scripts/vendor_bridge_sdk.py --destination /path/to/your_fap/vendor/internet_bridge`.
+2. Append `vendor/internet_bridge/*.c` and
+   `vendor/internet_bridge/sdk/flipper/*.c` to your manifest's sources.
+3. Use the ready-made USB/Bluetooth connection screen, then send a GET:
+
 ```c
-#include "sdk/flipper/fib_bridge_client.h"
+#include "vendor/internet_bridge/sdk/flipper/fib_bridge_setup.h"
 
 FibBridgeClientConfig config = {.app_version = "1.0"};
 FibBridgeClientCallbacks callbacks = {
@@ -262,13 +388,19 @@ FibBridgeClientCallbacks callbacks = {
     .context = app,
 };
 FibBridgeClient* client = fib_bridge_client_alloc(&config, &callbacks);
-fib_bridge_client_start(client);
+if(client && fib_bridge_client_connect_ui(client)) {
+    fib_bridge_client_get(client, "https://api.github.com/zen", 15000);
+}
 ```
 
-Call `fib_bridge_client_tick()` from the app event loop, wait for
-`FibBridgeStateReady`, then use `fib_bridge_client_get()`. Responses arrive in
+The setup screen handles transport choice, explicit computer selection, code
+display and waiting for separate desktop internet consent; Back cancels setup.
+Call it from your application thread before registering your fullscreen UI.
+After it returns, call `fib_bridge_client_tick()` from your app event loop and
+`fib_bridge_client_free()` on shutdown. Responses arrive in
 bounded chunks through `on_body`; the SDK never allocates a complete response.
-Integration instructions and lifecycle constraints are in
+Core APIs for custom pairing/revocation screens, a complete buildable example
+and lifecycle constraints are in
 [sdk/flipper/README.md](sdk/flipper/README.md).
 
 ## Build the `.app` and `.dmg`
@@ -283,10 +415,12 @@ chmod +x scripts/package_macos.sh
 Outputs:
 
 ```text
-dist/macos/Flipper Internet Bridge.app
+dist/macos/Build.noindex/Flipper Internet Bridge.app
 dist/macos/Flipper-Internet-Bridge.dmg
 ```
 
+The staging `.app` is kept outside Spotlight indexing so it does not appear as
+another installed application. Install only one copy in `/Applications`.
 The packaging script includes the project app icon, creates an ad-hoc signature,
 and places an Applications shortcut in the DMG. This MVP is not Developer ID
 signed or notarized. On another Mac, the first launch may require Control-click
@@ -295,11 +429,13 @@ that runs the script.
 
 ## Install and connect
 
-1. Copy `dist/usb_internet_bridge.fap` to `/ext/apps/USB/` with qFlipper.
+1. Copy `dist/usb_internet_bridge.fap` to `/ext/apps/Tools/` with qFlipper.
 2. Install and start either the native macOS helper or the cross-platform host.
-3. Open **Apps → USB → USB Internet Bridge** on the Flipper.
-4. The FAP saves the current USB configuration, enables `usb_cdc_dual`, and owns
-   only the second CDC channel. The first channel remains available to the CLI.
+3. Open **Apps → Tools → Internet Bridge** on the Flipper, then choose
+   **USB Internet Bridge**. For wireless setup choose **Bluetooth Internet Bridge**
+   and follow [the Bluetooth connection steps](docs/connection-modes.md).
+4. In USB mode the FAP saves the current USB configuration, enables `usb_cdc_dual`,
+   and owns only the second CDC channel. The first remains available to the CLI.
 5. The helper discovers candidates through IOKit and waits for a valid binary
    HELLO before showing any permission prompt.
 6. Choose **Allow Once** or **Always Allow** on the desktop host.
@@ -369,6 +505,21 @@ clang -std=c11 -Wall -Wextra -Werror -pedantic -I. \
   markets.c tests/test_markets.c \
   -o .build-tests/test_markets
 ./.build-tests/test_markets
+
+clang -std=c11 -Wall -Wextra -Werror -pedantic -I. \
+  toolbox_tools.c tests/test_toolbox_tools.c \
+  -o .build-tests/test_toolbox_tools
+./.build-tests/test_toolbox_tools
+
+clang -std=c11 -Wall -Wextra -Werror -pedantic -I. \
+  toolbox_tools.c toolbox_cards.c tests/test_toolbox_cards.c \
+  -o .build-tests/test_toolbox_cards
+./.build-tests/test_toolbox_cards
+clang -std=c11 -Wall -Wextra -Werror -pedantic -Itests/ui_stubs -I. \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  toolbox_tools.c toolbox_cards.c toolbox_ui.c tests/test_toolbox_ui.c \
+  -o .build-tests/test_toolbox_ui
+./.build-tests/test_toolbox_ui
 ```
 
 Python codec and simulator:
@@ -387,15 +538,22 @@ swift test
 Flipper build validation:
 
 ```sh
-../../venv/bin/ufbt
+./.ufbt-venv/bin/ufbt
 ```
 
-The current suite includes 36 Python tests, portable C protocol and market
-parser tests, and 63 Swift tests. It covers frame encoding, fragmentation and
+The 2026-10-08 SDK follow-up ran 91 Python tests successfully and 111 Swift tests
+(105 passed, six opt-in live/hardware tests skipped), plus portable C protocol,
+market and Toolbox parser/UI tests. It covers frame encoding, fragmentation and
 resynchronization, CRC,
 invalid lengths, handshake/version negotiation, permission decisions, request
 IDs and sequences, SSRF policy, redirects, timeout, response limits,
 cancellation, USB loss, and National Today extraction.
+
+See [Toolbox validation](docs/toolbox-testing.md) for the new tools' live-provider
+commands and the physical-device checklist. Offline success is not a physical
+Flipper test.
+See [SDK validation](docs/test-results-2026-10-08-sdk.md) for exported consumer
+builds, setup/nonce/consent tests and the USB/Bluetooth hardware boundary.
 
 ## Central limits
 
@@ -439,7 +597,7 @@ HELLO, and UID. The FAP uses CDC channel 1 while the CLI remains on channel 0.
 ### `ufbt launch` says more than one Flipper is attached
 
 uFBT may see multiple serial candidates created by dual CDC. Use qFlipper File
-Manager to copy `dist/usb_internet_bridge.fap` to `/ext/apps/USB/`, then launch it
+Manager to copy `dist/usb_internet_bridge.fap` to `/ext/apps/Tools/`, then launch it
 on the device.
 
 ### SwiftPM reports `PackageDescription` or `SwiftBridging` errors

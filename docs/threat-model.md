@@ -30,6 +30,16 @@ Wi-Fi configuration, Internet Sharing, or arbitrary URL scheme access.
 
 ## Residual risks
 
+- The opt-in Bluetooth Alpha uses authenticated BLE pairing but does not treat
+  advertisements, names or self-reported UIDs as device attestation. It never
+  reuses USB persistent permissions: consent is fresh for each BLE connection.
+  Its additional bridge-code recognition stores bearer tokens in Mac Keychain
+  and the Flipper application's microSD directory. Physical SD access compromises
+  those tokens; revoke removes app credentials, not unrelated system/phone bonds.
+  See [Bluetooth Alpha](bluetooth-alpha.md) for transport and supervision limits.
+- Bluetooth Internet Radio is unsupported. Helpers reject explicit audio
+  requests before network dispatch and reject audio responses on BLE. The
+  experimental converters/subprocesses were removed; no FFmpeg is needed.
 - The native macOS host's URLSession does not expose a supported way to bind a prior
   `getaddrinfo` result to the TLS socket. DNS rebinding between validation and
   connection is reduced but not eliminated. A production-hardening phase should
@@ -50,3 +60,11 @@ Wi-Fi configuration, Internet Sharing, or arbitrary URL scheme access.
 - The helper is intentionally not sandboxed in the command-line SwiftPM MVP;
   distribution should add signing, hardened runtime, sandbox entitlements review,
   and notarization.
+## Independent connection ownership
+
+Internet Bridge has explicit USB and Bluetooth entry points. macOS holds two
+separate coordinators, network clients and prompt owners. A tab selection is
+presentation only; stopping/revoking a channel cannot grant, cancel or dismiss
+the other channel's permission. USB stored grants never authorize Bluetooth.
+See [connection modes](connection-modes.md). This supersedes historical Alpha
+navigation, not the BLE encryption/code or HTTPS/SSRF limitations above.

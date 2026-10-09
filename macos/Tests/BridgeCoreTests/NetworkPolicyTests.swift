@@ -89,7 +89,7 @@ final class NetworkPolicyTests: XCTestCase {
             BridgeHTTPHeader(name: "X-Test", value: "ignored"),
         ])
         XCTAssertEqual(filtered, [BridgeHTTPHeader(name: "Accept", value: "application/json")])
-        XCTAssertEqual(BridgeConfiguration.fixedUserAgent, "FlipperUSBInternetBridge/0.3")
+        XCTAssertEqual(BridgeConfiguration.fixedUserAgent, "FlipperUSBInternetBridge/0.5")
     }
 
     func testIPv6LoopbackLinkLocalUniqueLocalMappedPrivateAndMulticastAreBlocked() {

@@ -32,12 +32,45 @@ jobs:
         run: |
           clang -std=c11 -Wall -Wextra -Werror -pedantic \
             -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            bridge_menu.c tests/test_bridge_menu.c -o /tmp/test_bridge_menu
+          /tmp/test_bridge_menu
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
             markets.c tests/test_markets.c -o /tmp/test_markets
           /tmp/test_markets
           clang -std=c11 -Wall -Wextra -Werror -pedantic \
             -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
             bridge_protocol.c tests/test_bridge_protocol.c -o /tmp/test_bridge_protocol
           /tmp/test_bridge_protocol
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            bridge_protocol.c ble_pairing.c tests/test_ble_pairing.c -o /tmp/test_ble_pairing
+          /tmp/test_ble_pairing
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            toolbox_tools.c tests/test_toolbox_tools.c -o /tmp/test_toolbox_tools
+          /tmp/test_toolbox_tools
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            toolbox_tools.c toolbox_cards.c tests/test_toolbox_cards.c -o /tmp/test_toolbox_cards
+          /tmp/test_toolbox_cards
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -Itests/ui_stubs -I. \
+            toolbox_tools.c toolbox_cards.c toolbox_ui.c tests/test_toolbox_ui.c -o /tmp/test_toolbox_ui
+          /tmp/test_toolbox_ui
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -Itests/sdk_stubs -I. \
+            sdk/flipper/fib_bridge_client.c sdk/flipper/fib_bridge_setup.c tests/test_bridge_sdk.c \
+            -o /tmp/test_bridge_sdk
+          /tmp/test_bridge_sdk
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            radio_player.c tests/test_radio_player.c -o /tmp/test_radio_player
+          /tmp/test_radio_player
+          clang -std=c11 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -I. \
+            tests/test_bridge_timing.c -o /tmp/test_bridge_timing
+          /tmp/test_bridge_timing
       - name: Build with ufbt
         uses: flipperdevices/flipperzero-ufbt-action@v0.1
         id: build-app

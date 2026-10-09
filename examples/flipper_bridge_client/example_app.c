@@ -1,4 +1,4 @@
-#include "../../sdk/flipper/fib_bridge_client.h"
+#include "../../sdk/flipper/fib_bridge_setup.h"
 #include <furi.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
@@ -74,7 +74,7 @@ int32_t fib_sdk_example_main(void* argument) {
     const FibBridgeClientConfig config = {.app_version = "sdk-example-1"};
     const FibBridgeClientCallbacks callbacks = {.on_body = example_body, .context = app};
     app->bridge = fib_bridge_client_alloc(&config, &callbacks);
-    if(!app->bridge || !fib_bridge_client_start(app->bridge)) {
+    if(!app->bridge || !fib_bridge_client_connect_ui(app->bridge)) {
         if(app->bridge) fib_bridge_client_free(app->bridge);
         furi_message_queue_free(app->input);
         furi_mutex_free(app->mutex);

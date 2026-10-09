@@ -10,10 +10,14 @@ let package = Package(
         .executable(name: "FlipperInternetBridge", targets: ["FlipperInternetBridge"]),
     ],
     targets: [
+        .target(name: "HostRadioDecoder"),
         .target(
             name: "BridgeCore",
+            dependencies: ["HostRadioDecoder"],
             linkerSettings: [
                 .linkedFramework("IOKit"),
+                .linkedFramework("CoreBluetooth"),
+                .linkedFramework("Security"),
             ]
         ),
         .executableTarget(

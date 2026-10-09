@@ -4,6 +4,7 @@ import Foundation
 
 public final class POSIXSerialTransport: SerialTransporting {
     private let ioQueue: DispatchQueue
+    private let ioQueueKey = DispatchSpecificKey<UInt8>()
     private let stateLock = NSLock()
     private var receiveHandler: ((Data) -> Void)?
     private var disconnectHandler: ((Error?) -> Void)?
@@ -14,6 +15,7 @@ public final class POSIXSerialTransport: SerialTransporting {
 
     public init(queue: DispatchQueue = DispatchQueue(label: "fibp.serial-io")) {
         ioQueue = queue
+        ioQueue.setSpecific(key: ioQueueKey, value: 1)
     }
 
     deinit { close() }
@@ -87,9 +89,9 @@ public final class POSIXSerialTransport: SerialTransporting {
         guard canWrite else { throw SerialTransportError.notOpen }
         guard !data.isEmpty else { return }
 
-        ioQueue.async { [weak self] in
-            guard let self, self.descriptorIsCurrent(fd) else { return }
-            var failure: Int32?
+        var failure: Int32?
+        let writeData = {
+            guard self.descriptorIsCurrent(fd) else { failure = ENOTCONN; return }
             data.withUnsafeBytes { rawBuffer in
                 guard let base = rawBuffer.baseAddress else { return }
                 var written = 0
@@ -105,9 +107,9 @@ public final class POSIXSerialTransport: SerialTransporting {
                     )
                     if count > 0 {
                         written += count
-                        if written < rawBuffer.count {
-                            Darwin.usleep(BridgeConfiguration.serialWritePacingMicroseconds)
-                        }
+                        // The device now backpressures its CDC endpoint. A
+                        // per-64-byte sleep undersupplies PCM on macOS because
+                        // scheduler/coalescing delays add up on every write.
                     } else if count < 0 && errno == EINTR {
                         continue
                     } else if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -130,6 +132,12 @@ public final class POSIXSerialTransport: SerialTransporting {
                 self.fail(fd: fd, error: SerialTransportError.writeFailed(failure))
             }
         }
+        // Bound the host-side queue too: return only once this small wire frame
+        // has been accepted. Otherwise continuous PCM creates an unbounded
+        // backlog of async closures while USB applies hardware backpressure.
+        if DispatchQueue.getSpecific(key: ioQueueKey) != nil { writeData() }
+        else { ioQueue.sync(execute: writeData) }
+        if let failure { throw SerialTransportError.writeFailed(failure) }
     }
 
     public func close() {

@@ -16,7 +16,6 @@ typedef enum {
     UsbTransportWorkerFlagRx = (1UL << 1),
     UsbTransportWorkerFlagState = (1UL << 2),
     UsbTransportWorkerFlagControlLine = (1UL << 3),
-    UsbTransportWorkerFlagOverflow = (1UL << 4),
 } UsbTransportWorkerFlag;
 
 struct UsbTransport {
@@ -25,7 +24,6 @@ struct UsbTransport {
     void* callback_context;
 
     FuriThread* worker;
-    FuriStreamBuffer* rx_stream;
     FuriMutex* state_mutex;
     FuriMutex* tx_mutex;
     FuriSemaphore* tx_semaphore;
@@ -59,17 +57,11 @@ static void usb_transport_cdc_rx(void* context) {
     UsbTransport* transport = context;
     if(!transport || !transport->accepting_callbacks) return;
 
-    uint8_t packet[CDC_DATA_SZ];
-    const int32_t received = furi_hal_cdc_receive(FIB_CDC_INTERFACE, packet, sizeof(packet));
-    if(received <= 0) return;
-
-    const size_t queued =
-        furi_stream_buffer_send(transport->rx_stream, packet, (size_t)received, 0U);
-    if(queued != (size_t)received) {
-        usb_transport_signal_worker(transport, UsbTransportWorkerFlagOverflow);
-    } else {
-        usb_transport_signal_worker(transport, UsbTransportWorkerFlagRx);
-    }
+    /* Leave the endpoint unread until the consumer can accept its packet.
+     * As in the firmware CLI VCP, this lets USB NAK apply backpressure instead
+     * of draining the endpoint into a finite queue and silently losing bytes.
+     * Never block the USB callback on audio playback or protocol parsing. */
+    usb_transport_signal_worker(transport, UsbTransportWorkerFlagRx);
 }
 
 static void usb_transport_cdc_state(void* context, CdcState state) {
@@ -139,30 +131,26 @@ static int32_t usb_transport_worker(void* context) {
     while(true) {
         const uint32_t flags = furi_thread_flags_wait(
             UsbTransportWorkerFlagStop | UsbTransportWorkerFlagRx | UsbTransportWorkerFlagState |
-                UsbTransportWorkerFlagControlLine | UsbTransportWorkerFlagOverflow,
+                UsbTransportWorkerFlagControlLine,
             FuriFlagWaitAny,
             FuriWaitForever);
         if((flags & FuriFlagError) != 0U) continue;
         if((flags & UsbTransportWorkerFlagStop) != 0U) break;
 
-        if((flags & UsbTransportWorkerFlagOverflow) != 0U) {
-            furi_stream_buffer_reset(transport->rx_stream);
-            usb_transport_notify(transport, UsbTransportEventRxOverflow);
+        if((flags & (UsbTransportWorkerFlagState | UsbTransportWorkerFlagControlLine)) != 0U) {
+            usb_transport_update_state(transport);
         }
 
         if((flags & UsbTransportWorkerFlagRx) != 0U) {
-            while(true) {
-                const size_t received =
-                    furi_stream_buffer_receive(transport->rx_stream, bytes, sizeof(bytes), 0U);
-                if(received == 0U) break;
+            while(transport->accepting_callbacks && transport->callback_usb_connected &&
+                  ((transport->callback_control_lines & CdcCtrlLineDTR) != 0U)) {
+                const int32_t received =
+                    furi_hal_cdc_receive(FIB_CDC_INTERFACE, bytes, sizeof(bytes));
+                if(received <= 0) break;
                 if(transport->receive_callback) {
-                    transport->receive_callback(bytes, received, transport->callback_context);
+                    transport->receive_callback(bytes, (size_t)received, transport->callback_context);
                 }
             }
-        }
-
-        if((flags & (UsbTransportWorkerFlagState | UsbTransportWorkerFlagControlLine)) != 0U) {
-            usb_transport_update_state(transport);
         }
     }
 
@@ -180,14 +168,13 @@ UsbTransport* usb_transport_alloc(
     transport->receive_callback = receive_callback;
     transport->event_callback = event_callback;
     transport->callback_context = callback_context;
-    transport->rx_stream = furi_stream_buffer_alloc(FIB_CDC_RX_STREAM_SIZE, 1U);
     transport->state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     transport->tx_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     transport->tx_semaphore = furi_semaphore_alloc(1U, 1U);
     transport->worker = furi_thread_alloc_ex(
         "FibUsbWorker", FIB_TRANSPORT_WORKER_STACK, usb_transport_worker, transport);
 
-    if(!transport->rx_stream || !transport->state_mutex || !transport->tx_mutex ||
+    if(!transport->state_mutex || !transport->tx_mutex ||
        !transport->tx_semaphore || !transport->worker) {
         usb_transport_free(transport);
         return NULL;
@@ -216,7 +203,6 @@ bool usb_transport_start(UsbTransport* transport) {
     if(!transport || transport->started) return false;
 
     usb_transport_reset_connection_latches(transport);
-    furi_stream_buffer_reset(transport->rx_stream);
 
     if(furi_hal_usb_is_locked()) {
         FURI_LOG_W(TAG, "USB mode is locked");
@@ -260,7 +246,6 @@ void usb_transport_stop(UsbTransport* transport) {
     furi_thread_join(transport->worker);
 
     usb_transport_reset_connection_latches(transport);
-    furi_stream_buffer_reset(transport->rx_stream);
 
     if(transport->usb_config_changed) {
         if(!furi_hal_usb_set_config(transport->previous_usb_config, NULL)) {
@@ -378,6 +363,5 @@ void usb_transport_free(UsbTransport* transport) {
     if(transport->tx_semaphore) furi_semaphore_free(transport->tx_semaphore);
     if(transport->tx_mutex) furi_mutex_free(transport->tx_mutex);
     if(transport->state_mutex) furi_mutex_free(transport->state_mutex);
-    if(transport->rx_stream) furi_stream_buffer_free(transport->rx_stream);
     free(transport);
 }

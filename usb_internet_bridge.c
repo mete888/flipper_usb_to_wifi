@@ -1,8 +1,13 @@
 #include "bridge_session.h"
+#include "bridge_menu.h"
+#include "ble_pairing_storage.h"
 #include "markets.h"
 #include "radio_player.h"
+#include "toolbox_tools.h"
+#include "toolbox_ui.h"
 
 #include <furi.h>
+#include <furi/core/memmgr_heap.h>
 #include <gui/gui.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/text_input.h>
@@ -24,7 +29,7 @@
 #define FIB_RADIO_COUNTRY_SIZE 48U
 #define FIB_RADIO_URL_BASE \
     "https://all.api.radio-browser.info/json/stations/search?limit=5&hidebroken=true" \
-    "&is_https=true&codec=MP3&bitrateMax=64&order=clickcount&reverse=true&"
+    "&is_https=true&codec=MP3&bitrateMin=8&bitrateMax=%u&order=clickcount&reverse=true&"
 #define FIB_SEARCH_URL_PREFIX                                                       \
     "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrlimit=1" \
     "&prop=extracts&exchars=420&explaintext=1&redirects=1&format=json&formatversion=2" \
@@ -41,6 +46,7 @@
     "precipitation_probability_max&timezone=auto&forecast_days=1"
 
 typedef enum {
+    FibViewTransport,
     FibViewMenu,
     FibViewToolbox,
     FibViewMarkets,
@@ -48,16 +54,11 @@ typedef enum {
     FibViewUrlInput,
     FibViewWeatherResults,
     FibViewRadioStations,
+    FibViewCurrencies,
+    FibViewToolCards,
+    FibViewBluetoothRequests,
+    FibViewBluetoothPairings,
 } FibView;
-
-typedef enum {
-    FibMenuToolbox,
-    FibMenuTestConnection,
-    FibMenuDownloadSample,
-    FibMenuGetDateTime,
-    FibMenuCustomUrl,
-    FibMenuConnectionInfo,
-} FibMenuItem;
 
 typedef enum {
     FibToolboxInformationSearch,
@@ -66,10 +67,15 @@ typedef enum {
     FibToolboxIssLocation,
     FibToolboxInternetRadio,
     FibToolboxMarkets,
+    FibToolboxEarthquakes,
+    FibToolboxCurrency,
+    FibToolboxDictionary,
 } FibToolboxItem;
 
 typedef enum {
     FibCustomEventSessionUpdated = 1U,
+    FibCustomEventBluetoothRequests = 4U,
+    FibCustomEventBluetoothPairings = 5U,
 } FibCustomEvent;
 
 typedef enum {
@@ -84,6 +90,10 @@ typedef enum {
     FibRequestModeRadioSearch,
     FibRequestModeRadioPlaying,
     FibRequestModeRadioStopped,
+    FibRequestModeRadioUnavailable,
+    FibRequestModeEarthquakes,
+    FibRequestModeCurrency,
+    FibRequestModeDictionary,
 } FibRequestMode;
 
 typedef enum {
@@ -97,6 +107,9 @@ typedef enum {
     FibPendingActionIssLocation,
     FibPendingActionRadioCountryInput,
     FibPendingActionCustomUrlInput,
+    FibPendingActionEarthquakes,
+    FibPendingActionCurrency,
+    FibPendingActionDictionary,
 } FibPendingAction;
 
 typedef struct {
@@ -115,8 +128,25 @@ typedef struct {
     Gui* gui;
     ViewDispatcher* view_dispatcher;
     Submenu* menu;
+    Submenu* transport_menu;
+    BridgeTransportMode selected_transport;
     Submenu* toolbox;
     Submenu* markets;
+    Submenu* currencies;
+    Submenu* bluetooth_requests;
+    Submenu* bluetooth_pairings;
+    uint8_t paired_hosts[8][16];
+    size_t paired_host_count;
+    size_t paired_host_offset;
+    bool paired_hosts_more;
+    bool showing_pairing_revoke;
+    uint8_t revoke_host[16];
+    ToolboxUI* tool_cards;
+    ToolboxConverter converter;
+    unsigned converter_input_side;
+    uint32_t tool_response_id;
+    bool currency_select_to;
+    char currency_prompt[32];
     unsigned market_index;
     Submenu* weather_results;
     Submenu* radio_stations;
@@ -138,6 +168,10 @@ typedef struct {
     FibView current_view;
     FibView navigation_root;
     bool showing_connection_info;
+    bool showing_pairing;
+    bool showing_bluetooth_request;
+    uint64_t selected_ble_request_nonce;
+    FibView pairing_return_view;
     FibRequestMode request_mode;
     FibWeatherLocation locations[FIB_WEATHER_RESULT_LIMIT];
     uint8_t location_count;
@@ -166,10 +200,22 @@ static void fib_app_continue_pending_action(FibApp* app, FibPendingAction action
 static void fib_app_request_or_wait(FibApp* app, const char* url);
 static void fib_app_show_status(FibApp* app, bool connection_info);
 static void fib_app_render_status(FibApp* app);
+static void fib_app_currency_selected(void* context, uint32_t index);
+static void fib_app_show_currencies(FibApp* app, bool select_to);
+static void fib_app_fetch_currency(FibApp* app);
+static void fib_app_show_converter(FibApp* app, const char* note);
+static void fib_app_tool_action(void* context, ToolboxUIAction action);
+static bool fib_app_tool_validator(const char* text, FuriString* error, void* context);
+static void fib_app_start_when_ready(FibApp* app, FibPendingAction action, FibRequestMode waiting_mode);
+static void fib_app_build_mode_menu(FibApp* app);
 
 static bool fib_app_radio_body(void* context, const uint8_t* data, size_t length) {
     FibApp* app = context;
     return app && app->radio_player && radio_player_push(app->radio_player, data, length);
+}
+
+static bool fib_app_request_radio(FibApp* app) {
+    return bridge_session_request_radio(app->session, app->url_buffer, FIB_MAX_REQUEST_TIMEOUT_MS);
 }
 
 static void fib_app_stop_radio(FibApp* app) {
@@ -186,14 +232,35 @@ static void fib_app_stop_radio(FibApp* app) {
     radio_player_request_stop(app->radio_player);
     bridge_session_set_body_callback(app->session, NULL, NULL);
     bridge_session_cancel(app->session);
+    /* PCM playback has no decoder worker to release these resources for us.
+     * The same GUI thread which acquired the speaker releases it on Stop. */
+    radio_player_stop(app->radio_player);
     app->request_waiting_for_ready = false;
     app->pending_action = FibPendingActionNone;
 }
 
 static bool fib_app_start_selected_radio(FibApp* app) {
     if(!app) return false;
+    bridge_session_get_snapshot(app->session, &app->snapshot);
+    if(app->snapshot.bluetooth_alpha || !app->snapshot.radio_pcm_supported) return false;
+    /* Text/BLE tools do not need the speaker reservoir. Allocate only on Play. */
+    if(!app->radio_player) {
+        bridge_session_get_snapshot(app->session, &app->snapshot);
+        /* Account for the actual PCM reservoir, not the removed MP3 decoder.
+         * Official Furi malloc aborts on OOM: keep admission checks. */
+        const size_t required = radio_player_required_heap();
+        const size_t block = required - 4096U;
+        if(memmgr_get_free_heap() < required || memmgr_heap_get_max_free_block() < block) return false;
+        app->radio_player = radio_player_alloc();
+    }
+    if(!app->radio_player) return false;
     radio_player_request_stop(app->radio_player);
-    if(!radio_player_start(app->radio_player)) return false;
+    bridge_session_clear_body_callback_and_wait(app->session);
+    if(!radio_player_start(app->radio_player)) {
+        radio_player_free(app->radio_player);
+        app->radio_player = NULL;
+        return false;
+    }
     app->request_mode = FibRequestModeRadioPlaying;
     app->radio_last_retry_tick = furi_get_tick();
     app->radio_last_ui_tick = 0U;
@@ -746,6 +813,11 @@ static const char* fib_permission_text(BridgePermission permission) {
 static void fib_app_cancel_button(GuiButtonType button, InputType input_type, void* context) {
     FibApp* app = context;
     if(!app || button != GuiButtonTypeCenter || input_type != InputTypeShort) return;
+    if(app->request_mode == FibRequestModeEarthquakes && !app->snapshot.active_request) {
+        fib_app_request_or_wait(app, TOOLBOX_EARTHQUAKES_URL);
+        fib_app_render_status(app);
+        return;
+    }
     if(app->request_mode == FibRequestModeMarkets) {
         if(bridge_session_has_active_request(app->session)) return;
         app->market_last_refresh_tick = furi_get_tick();
@@ -779,9 +851,86 @@ static void fib_app_radio_stations_button(
     view_dispatcher_switch_to_view(app->view_dispatcher, FibViewRadioStations);
 }
 
+static void fib_app_bluetooth_request_button(GuiButtonType button, InputType type, void* context) {
+    FibApp* app = context;
+    if(type != InputTypeShort || (button != GuiButtonTypeLeft && button != GuiButtonTypeRight)) return;
+    bridge_session_respond_bluetooth_request(app->session, app->selected_ble_request_nonce,
+        button == GuiButtonTypeRight);
+    app->showing_bluetooth_request = false;
+    app->current_view = FibViewMenu;
+    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewMenu);
+}
+
+static void fib_app_pairing_revoke_button(GuiButtonType button, InputType type, void* context) {
+    FibApp* app = context;
+    if(type != InputTypeShort || (button != GuiButtonTypeLeft && button != GuiButtonTypeRight)) return;
+    if(button == GuiButtonTypeRight && !bridge_session_revoke_bluetooth_host(app->session, app->revoke_host)) {
+        widget_reset(app->status_widget);
+        widget_add_string_element(app->status_widget, 64, 22, AlignCenter, AlignCenter,
+            FontSecondary, "Could not remove pairing");
+        widget_add_string_element(app->status_widget, 64, 38, AlignCenter, AlignCenter,
+            FontSecondary, "Check SD card; Back to return");
+        return;
+    }
+    app->showing_pairing_revoke = false;
+    app->paired_host_offset = 0;
+    view_dispatcher_send_custom_event(app->view_dispatcher, FibCustomEventBluetoothPairings);
+}
+
 static void fib_app_render_status(FibApp* app) {
     bridge_session_get_snapshot(app->session, &app->snapshot);
     furi_string_reset(app->status_text);
+    if(app->showing_pairing_revoke) {
+        widget_reset(app->status_widget);
+        widget_add_string_element(app->status_widget, 64, 10, AlignCenter, AlignCenter,
+            FontPrimary, "Revoke Pairing?");
+        char label[24]; snprintf(label, sizeof(label), "PC %02X%02X%02X%02X",
+            app->revoke_host[0], app->revoke_host[1], app->revoke_host[2], app->revoke_host[3]);
+        widget_add_string_element(app->status_widget, 64, 27, AlignCenter, AlignCenter, FontSecondary, label);
+        widget_add_string_element(app->status_widget, 64, 40, AlignCenter, AlignCenter,
+            FontSecondary, "Bridge recognition only");
+        widget_add_button_element(app->status_widget, GuiButtonTypeLeft, "Keep", fib_app_pairing_revoke_button, app);
+        widget_add_button_element(app->status_widget, GuiButtonTypeRight, "Revoke", fib_app_pairing_revoke_button, app);
+        return;
+    }
+    if(app->snapshot.pairing_pending) {
+        widget_reset(app->status_widget);
+        widget_add_string_element(app->status_widget, 64, 11,
+            AlignCenter, AlignCenter, FontPrimary, "Bluetooth Pairing");
+        widget_add_string_element(app->status_widget, 64, 32,
+            AlignCenter, AlignCenter, FontBigNumbers, app->snapshot.pairing_code);
+        widget_add_string_element(app->status_widget, 64, 51,
+            AlignCenter, AlignCenter, FontSecondary, "Enter code on computer");
+        widget_add_string_element(app->status_widget, 64, 61,
+            AlignCenter, AlignCenter, FontSecondary, "Back: Cancel");
+        return;
+    }
+    if(app->showing_bluetooth_request) {
+        widget_reset(app->status_widget);
+        widget_add_string_element(app->status_widget, 64, 10,
+            AlignCenter, AlignCenter, FontPrimary, "Connection Request");
+        widget_add_string_element(app->status_widget, 64, 27,
+            AlignCenter, AlignCenter, FontSecondary, app->snapshot.pairing_host_label);
+        widget_add_string_element(app->status_widget, 64, 41,
+            AlignCenter, AlignCenter, FontSecondary,
+            app->snapshot.pairing_known_host ? "Recognized computer" : "New computer");
+        widget_add_button_element(app->status_widget, GuiButtonTypeLeft, "Reject",
+            fib_app_bluetooth_request_button, app);
+        widget_add_button_element(app->status_widget, GuiButtonTypeRight,
+            app->snapshot.pairing_known_host ? "Connect" : "Pair",
+            fib_app_bluetooth_request_button, app);
+        return;
+    }
+    if(app->request_mode == FibRequestModeRadioUnavailable) {
+        widget_reset(app->status_widget);
+        widget_add_string_element(app->status_widget, 64, 12,
+            AlignCenter, AlignCenter, FontPrimary, "Internet Radio");
+        widget_add_string_element(app->status_widget, 64, 31,
+            AlignCenter, AlignCenter, FontSecondary, "USB connection only");
+        widget_add_string_element(app->status_widget, 64, 47,
+            AlignCenter, AlignCenter, FontSecondary, "Select USB Internet Bridge");
+        return;
+    }
     bool market_card_ready = false;
 
     if(app->request_mode == FibRequestModeMarkets &&
@@ -910,19 +1059,44 @@ static void fib_app_render_status(FibApp* app) {
         furi_string_cat_str(app->status_text, "\e#Internet Radio\n");
         furi_string_cat_printf(
             app->status_text,
-            "%s\n\n%s\nFrames: %lu  Buf: %uK\nGaps: %lu",
+            "%s\n\n%s\n%s: %lu  Buf: %uK\nGaps: %lu",
             app->search_result,
-            app->request_mode == FibRequestModeRadioStopped ? "Stopped" :
+            app->request_mode == FibRequestModeRadioStopped ?
+                (radio_player_error(app->radio_player) ? radio_player_error(app->radio_player) :
+                 (app->snapshot.state == BridgeSessionStateError || app->snapshot.state == BridgeSessionStateTimedOut) ?
+                 app->snapshot.detail : "Stopped") :
             radio_player_decoded_frames(app->radio_player) ? "Playing on Flipper speaker" :
-                                                             "Buffering MP3 audio...",
+                                                             "Buffering radio audio...",
+            "Chunks",
             (unsigned long)radio_player_decoded_frames(app->radio_player),
             (unsigned)(radio_player_buffered_bytes(app->radio_player) / 1024U),
             (unsigned long)radio_player_underflows(app->radio_player));
+    } else if((app->request_mode == FibRequestModeEarthquakes ||
+               app->request_mode == FibRequestModeCurrency ||
+               app->request_mode == FibRequestModeDictionary) &&
+              app->snapshot.state == BridgeSessionStateComplete) {
+        const char* title = app->request_mode == FibRequestModeEarthquakes ? "Latest Earthquakes" :
+                            app->request_mode == FibRequestModeCurrency ? "Currency Converter" : "English Dictionary";
+        furi_string_cat_printf(app->status_text, "\e#%s\n", title);
+        if(app->snapshot.http_status == 404U && app->request_mode == FibRequestModeDictionary) {
+            furi_string_cat_str(app->status_text, "Word not found.\nCheck the spelling and try again.");
+        } else if(app->snapshot.http_status == 204U && app->request_mode == FibRequestModeEarthquakes) {
+            furi_string_cat_str(app->status_text, "No recent earthquakes reported.");
+        } else if(app->snapshot.http_status != 200U) {
+            furi_string_cat_printf(app->status_text, "Service returned HTTP %u.\nTry again later.", app->snapshot.http_status);
+        } else if(app->request_mode == FibRequestModeCurrency) {
+            furi_string_cat_str(app->status_text, "Select a currency or amount on the converter screen.");
+        } else if(strncmp(app->snapshot.preview, TOOLBOX_TEXT_MAGIC, strlen(TOOLBOX_TEXT_MAGIC)) == 0) {
+            furi_string_cat_str(app->status_text, app->snapshot.preview + strlen(TOOLBOX_TEXT_MAGIC));
+        } else {
+            furi_string_cat_str(app->status_text, "Update desktop helper to v0.5.0 or newer.");
+        }
     } else if(app->showing_connection_info) {
         furi_string_cat_printf(app->status_text, "\e#Connection Info\n");
         furi_string_cat_printf(
             app->status_text,
-            "USB: %s\nHost: %s\nPermission: %s\n",
+            "%s: %s\nHost: %s\nPermission: %s\n",
+            app->snapshot.bluetooth_alpha ? "Bluetooth" : "USB",
             app->snapshot.usb_connected ? "Connected" : "Disconnected",
             app->snapshot.helper_present ? "Found" : "Waiting",
             fib_permission_text(app->snapshot.permission));
@@ -960,7 +1134,9 @@ static void fib_app_render_status(FibApp* app) {
             app->snapshot.state == BridgeSessionStateWaitingForHelper ||
             app->snapshot.state == BridgeSessionStateDisconnected) {
             furi_string_cat_printf(
-                app->status_text, "Check the USB cable and desktop host.");
+                app->status_text, app->snapshot.bluetooth_alpha ?
+                    "Enable Bluetooth in the computer helper." :
+                    "Check the USB cable and desktop host.");
         }
     }
 
@@ -1004,7 +1180,8 @@ static void fib_app_render_status(FibApp* app) {
         const uint8_t text_height =
             (app->request_mode == FibRequestModeRadioPlaying ||
              app->request_mode == FibRequestModeRadioStopped) ? 44U :
-                                    (app->snapshot.active_request || app->request_mode == FibRequestModeMarkets) ? 52U : 64U;
+                                    (app->snapshot.active_request || app->request_mode == FibRequestModeMarkets ||
+                                     app->request_mode == FibRequestModeEarthquakes) ? 52U : 64U;
         widget_add_text_scroll_element(
             app->status_widget,
             0U,
@@ -1035,6 +1212,8 @@ static void fib_app_render_status(FibApp* app) {
             app->status_widget, GuiButtonTypeCenter, "Cancel", fib_app_cancel_button, app);
     } else if(app->request_mode == FibRequestModeMarkets && app->pending_action == FibPendingActionNone) {
         widget_add_button_element(app->status_widget, GuiButtonTypeCenter, "Refresh", fib_app_cancel_button, app);
+    } else if(app->request_mode == FibRequestModeEarthquakes && app->pending_action == FibPendingActionNone) {
+        widget_add_button_element(app->status_widget, GuiButtonTypeCenter, "Refresh", fib_app_cancel_button, app);
     }
 }
 
@@ -1059,16 +1238,143 @@ static bool fib_app_internet_ready(const BridgeSessionSnapshot* snapshot) {
            !snapshot->active_request;
 }
 
+static void fib_app_bluetooth_request_selected(void* context, uint32_t index) {
+    FibApp* app = context;
+    if(index != 1U) return;
+    bridge_session_get_snapshot(app->session, &app->snapshot);
+    if(!app->snapshot.pairing_request_pending) return;
+    app->selected_ble_request_nonce = app->snapshot.pairing_request_nonce;
+    app->showing_bluetooth_request = true;
+    app->current_view = FibViewStatus;
+    fib_app_render_status(app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewStatus);
+}
+
+static void fib_app_update_bluetooth_requests(FibApp* app) {
+    submenu_reset(app->bluetooth_requests);
+    submenu_set_header(app->bluetooth_requests, "Connection Requests");
+    submenu_add_item(app->bluetooth_requests,
+        app->snapshot.pairing_request_pending ? app->snapshot.pairing_host_label : "No pending requests",
+        app->snapshot.pairing_request_pending ? 1U : 0U, fib_app_bluetooth_request_selected, app);
+}
+
+static void fib_app_pairing_selected(void* context, uint32_t index) {
+    FibApp* app = context;
+    if(index == 9U && app->paired_hosts_more) {
+        app->paired_host_offset += app->paired_host_count;
+    } else if(index == 10U && app->paired_host_offset) {
+        app->paired_host_offset = app->paired_host_offset >= 8 ? app->paired_host_offset - 8 : 0;
+    } else if(index >= 1U && index <= app->paired_host_count) {
+        memcpy(app->revoke_host, app->paired_hosts[index - 1], sizeof(app->revoke_host));
+        app->showing_pairing_revoke = true;
+        app->current_view = FibViewStatus;
+        fib_app_render_status(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, FibViewStatus);
+        return;
+    } else return;
+    view_dispatcher_send_custom_event(app->view_dispatcher, FibCustomEventBluetoothPairings);
+}
+
 static bool fib_app_custom_event(void* context, uint32_t event) {
     FibApp* app = context;
-    if(!app || event != FibCustomEventSessionUpdated) return false;
+    if(!app) return false;
+    if(app->selected_transport == BridgeTransportNone) return true;
+    if(event == FibCustomEventBluetoothPairings) {
+        app->paired_host_count = fib_pair_storage_list(app->paired_hosts, 8,
+            app->paired_host_offset, &app->paired_hosts_more);
+        submenu_reset(app->bluetooth_pairings);
+        submenu_set_header(app->bluetooth_pairings, "Known Computers");
+        for(size_t i = 0; i < app->paired_host_count; ++i) {
+            char label[24]; snprintf(label, sizeof(label), "PC %02X%02X%02X%02X",
+                app->paired_hosts[i][0], app->paired_hosts[i][1], app->paired_hosts[i][2], app->paired_hosts[i][3]);
+            submenu_add_item(app->bluetooth_pairings, label, i + 1, fib_app_pairing_selected, app);
+        }
+        if(!app->paired_host_count) submenu_add_item(app->bluetooth_pairings,
+            "No recognized computers", 0, fib_app_pairing_selected, app);
+        if(app->paired_hosts_more) submenu_add_item(app->bluetooth_pairings, "Next page", 9, fib_app_pairing_selected, app);
+        if(app->paired_host_offset) submenu_add_item(app->bluetooth_pairings, "Previous page", 10, fib_app_pairing_selected, app);
+        app->current_view = FibViewBluetoothPairings;
+        view_dispatcher_switch_to_view(app->view_dispatcher, FibViewBluetoothPairings);
+        return true;
+    }
+    if(event == FibCustomEventBluetoothRequests) {
+        bridge_session_get_snapshot(app->session, &app->snapshot);
+        fib_app_update_bluetooth_requests(app);
+        app->current_view = FibViewBluetoothRequests;
+        view_dispatcher_switch_to_view(app->view_dispatcher, FibViewBluetoothRequests);
+        return true;
+    }
+    if(event >= ToolboxUIEditLeftCurrency && event <= ToolboxUIRefreshISS) {
+        if(app->current_view != FibViewToolCards) return true;
+        if(event == ToolboxUIEditLeftCurrency || event == ToolboxUIEditRightCurrency) {
+            bridge_session_cancel(app->session);
+            fib_app_show_currencies(app, event == ToolboxUIEditRightCurrency);
+            view_dispatcher_switch_to_view(app->view_dispatcher, FibViewCurrencies);
+        } else if(event == ToolboxUIEditLeftAmount || event == ToolboxUIEditRightAmount) {
+            app->converter_input_side = event == ToolboxUIEditRightAmount ? 1U : 0U;
+            unsigned side = app->converter_input_side;
+            snprintf(app->currency_prompt, sizeof(app->currency_prompt), "%s Amount",
+                     toolbox_currency_code(app->converter.currency[side]));
+            const char* amount = app->converter.amount[side];
+            snprintf(app->input_buffer, TOOLBOX_AMOUNT_SIZE, "%s",
+                     toolbox_valid_amount(amount) ? amount : "");
+            text_input_set_header_text(app->url_input, app->currency_prompt);
+            text_input_set_minimum_length(app->url_input, 1U);
+            text_input_set_validator(app->url_input, fib_app_tool_validator, app);
+            text_input_set_result_callback(app->url_input, fib_app_url_submitted, app,
+                app->input_buffer, TOOLBOX_AMOUNT_SIZE, false);
+            app->current_view = FibViewUrlInput;
+            view_dispatcher_switch_to_view(app->view_dispatcher, FibViewUrlInput);
+        } else if(event == ToolboxUIRefreshEarthquakes) {
+            bridge_session_cancel(app->session);
+            toolbox_ui_note(app->tool_cards, "Updating...");
+            fib_app_request_or_wait(app, TOOLBOX_EARTHQUAKES_URL);
+        } else if(event == ToolboxUISearchWord) {
+            fib_app_start_when_ready(app, FibPendingActionDictionary, FibRequestModeDictionary);
+        } else if(event == ToolboxUISearchWikipedia) {
+            fib_app_start_when_ready(app, FibPendingActionWikipediaInput, FibRequestModeWikipedia);
+        } else if(!app->snapshot.active_request) {
+            toolbox_ui_note(app->tool_cards, "Updating...");
+            const char* url = event == ToolboxUIRefreshNationalToday ? FIB_NATIONAL_TODAY_URL :
+                              event == ToolboxUIRefreshISS ? FIB_ISS_URL : app->url_buffer;
+            fib_app_request_or_wait(app, url);
+        }
+        return true;
+    }
+    if(event != FibCustomEventSessionUpdated) return false;
     bridge_session_get_snapshot(app->session, &app->snapshot);
+    fib_app_update_bluetooth_requests(app);
+    if(app->snapshot.pairing_pending) {
+        /* A code exchange must not be hidden behind an unrelated revoke dialog. */
+        app->showing_pairing_revoke = false;
+        if(!app->showing_pairing) {
+            app->pairing_return_view = app->showing_bluetooth_request ? FibViewMenu : app->current_view;
+            app->showing_bluetooth_request = false;
+            app->showing_pairing = true;
+        }
+        app->current_view = FibViewStatus;
+        fib_app_render_status(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, FibViewStatus);
+        return true;
+    }
+    if(app->showing_bluetooth_request && (!app->snapshot.pairing_request_pending ||
+       app->selected_ble_request_nonce != app->snapshot.pairing_request_nonce)) {
+        app->showing_bluetooth_request = false;
+        app->current_view = FibViewBluetoothRequests;
+        view_dispatcher_switch_to_view(app->view_dispatcher, FibViewBluetoothRequests);
+        return true;
+    }
+    if(app->showing_pairing) {
+        app->showing_pairing = false;
+        app->current_view = app->pairing_return_view;
+        view_dispatcher_switch_to_view(app->view_dispatcher, app->current_view);
+    }
 
     if(app->request_mode == FibRequestModeRadioPlaying &&
        radio_player_is_running(app->radio_player) &&
        app->snapshot.state == BridgeSessionStateComplete &&
        !app->snapshot.active_request) {
-        bridge_session_request_radio(app->session, app->url_buffer, 30000U);
+        fib_app_request_radio(app);
         bridge_session_get_snapshot(app->session, &app->snapshot);
     }
 
@@ -1090,7 +1396,81 @@ static bool fib_app_custom_event(void* context, uint32_t event) {
         bridge_session_get_snapshot(app->session, &app->snapshot);
     }
 
-    if(app->request_mode == FibRequestModeWeatherSearch &&
+    if(app->request_mode == FibRequestModeCurrency && app->pending_action == FibPendingActionNone &&
+       (app->current_view == FibViewToolCards || app->current_view == FibViewUrlInput)) {
+        const char* note = NULL;
+        if(app->snapshot.state == BridgeSessionStateComplete &&
+           app->tool_response_id != app->snapshot.active_request_id) {
+            app->tool_response_id = app->snapshot.active_request_id;
+            if(app->snapshot.http_status != 200U) note = "Rate service unavailable";
+            else if(!toolbox_converter_rate(&app->converter, app->snapshot.preview))
+                note = "Rate unavailable / update helper";
+        } else if(app->snapshot.active_request) note = "Getting reference rate...";
+        else if(app->snapshot.state == BridgeSessionStateError ||
+                app->snapshot.state == BridgeSessionStateTimedOut ||
+                app->snapshot.state == BridgeSessionStatePermissionDenied ||
+                !app->snapshot.usb_connected) note = fib_state_text(app->snapshot.state);
+        toolbox_ui_currency(app->tool_cards, &app->converter, note);
+    } else if((app->request_mode == FibRequestModeWikipedia ||
+               app->request_mode == FibRequestModeWeatherForecast ||
+               app->request_mode == FibRequestModeNationalToday ||
+               app->request_mode == FibRequestModeIssLocation) &&
+              app->pending_action == FibPendingActionNone &&
+              (app->current_view == FibViewStatus || app->current_view == FibViewToolCards) &&
+              app->snapshot.state == BridgeSessionStateComplete &&
+              app->tool_response_id != app->snapshot.active_request_id) {
+        app->tool_response_id = app->snapshot.active_request_id;
+        bool valid = false;
+        if(app->snapshot.http_status == 200U) {
+            if(app->request_mode == FibRequestModeWikipedia) {
+                valid = fib_app_extract_search_result(app->snapshot.preview, app->search_result, sizeof(app->search_result));
+                if(valid) toolbox_ui_reader(app->tool_cards, "Wikipedia", app->input_buffer,
+                    app->search_result, false, ToolboxUISearchWikipedia);
+            } else if(app->request_mode == FibRequestModeNationalToday) {
+                valid = app->snapshot.preview[0] != '\0';
+                if(valid) {
+                    toolbox_ui_reader(app->tool_cards, "National Today", "",
+                        app->snapshot.preview, true, ToolboxUIRefreshNationalToday);
+                    if(app->snapshot.response_bytes > FIB_RESPONSE_PREVIEW_SIZE ||
+                       app->snapshot.response_truncated) toolbox_ui_reader_shortened(app->tool_cards);
+                }
+            } else if(app->request_mode == FibRequestModeWeatherForecast) {
+                valid = fib_app_format_weather(app->snapshot.preview, app->search_result, sizeof(app->search_result)) &&
+                    toolbox_ui_weather(app->tool_cards, app->input_buffer, app->search_result);
+            } else {
+                valid = fib_app_format_iss(app->snapshot.preview, app->search_result, sizeof(app->search_result)) &&
+                    toolbox_ui_iss(app->tool_cards, app->search_result);
+            }
+        }
+        if(valid) {
+            app->current_view = FibViewToolCards;
+            view_dispatcher_switch_to_view(app->view_dispatcher, FibViewToolCards);
+        } else fib_app_show_status(app, false);
+    } else if(app->current_view == FibViewToolCards &&
+              (app->request_mode == FibRequestModeWikipedia ||
+               app->request_mode == FibRequestModeWeatherForecast ||
+               app->request_mode == FibRequestModeNationalToday ||
+               app->request_mode == FibRequestModeIssLocation)) {
+        toolbox_ui_note(app->tool_cards, app->snapshot.active_request ? "Updating..." :
+            app->snapshot.state == BridgeSessionStateComplete ? "" : fib_state_text(app->snapshot.state));
+    } else if((app->request_mode == FibRequestModeEarthquakes || app->request_mode == FibRequestModeDictionary) &&
+              app->pending_action == FibPendingActionNone &&
+              (app->current_view == FibViewStatus || app->current_view == FibViewToolCards) &&
+              app->snapshot.state == BridgeSessionStateComplete &&
+              app->tool_response_id != app->snapshot.active_request_id) {
+        app->tool_response_id = app->snapshot.active_request_id;
+        bool valid = app->snapshot.http_status == 200U &&
+            (app->request_mode == FibRequestModeEarthquakes ?
+                toolbox_ui_earthquakes(app->tool_cards, app->snapshot.preview) :
+                toolbox_ui_dictionary(app->tool_cards, app->snapshot.preview));
+        if(valid) {
+            app->current_view = FibViewToolCards;
+            view_dispatcher_switch_to_view(app->view_dispatcher, FibViewToolCards);
+        } else fib_app_show_status(app, false);
+    } else if(app->current_view == FibViewToolCards && app->request_mode == FibRequestModeEarthquakes) {
+        toolbox_ui_note(app->tool_cards, app->snapshot.active_request ? "Updating..." :
+            app->snapshot.state == BridgeSessionStateComplete ? "" : fib_state_text(app->snapshot.state));
+    } else if(app->request_mode == FibRequestModeWeatherSearch &&
               app->snapshot.state == BridgeSessionStateComplete &&
               !app->weather_results_shown) {
         app->weather_results_shown = true;
@@ -1156,16 +1536,30 @@ static void fib_app_tick(void* context) {
             fib_app_request_or_wait(app, app->url_buffer);
         }
     }
-    if(app->request_mode != FibRequestModeRadioPlaying ||
-       !radio_player_is_running(app->radio_player)) return;
+    if(app->request_mode != FibRequestModeRadioPlaying) return;
+    if(!radio_player_is_running(app->radio_player)) {
+        // A failed decoder must not leave the UI pretending playback continues
+        // or silently start an endless network retry loop.
+        fib_app_stop_radio(app);
+        fib_app_render_status(app);
+        return;
+    }
     bridge_session_get_snapshot(app->session, &app->snapshot);
+    if(!app->snapshot.active_request &&
+       (app->snapshot.state == BridgeSessionStateError || app->snapshot.state == BridgeSessionStateTimedOut ||
+        app->snapshot.state == BridgeSessionStateCancelled || !app->snapshot.usb_connected)) {
+        radio_player_stop(app->radio_player);
+        app->request_mode = FibRequestModeRadioStopped;
+        fib_app_render_status(app);
+        return;
+    }
     if(!app->snapshot.active_request && app->snapshot.usb_connected &&
        app->snapshot.helper_present && app->snapshot.selected_major != 0U &&
        (app->snapshot.permission == BridgePermissionAllowedOnce ||
         app->snapshot.permission == BridgePermissionAllowedAlways) &&
        (uint32_t)(now - app->radio_last_retry_tick) >= furi_ms_to_ticks(500U)) {
         app->radio_last_retry_tick = now;
-        bridge_session_request_radio(app->session, app->url_buffer, 30000U);
+        fib_app_request_radio(app);
     }
     if(app->current_view == FibViewStatus &&
        (uint32_t)(now - app->radio_last_ui_tick) >= furi_ms_to_ticks(500U)) {
@@ -1180,9 +1574,9 @@ static uint32_t fib_app_back_to_root(void* context) {
     FibView destination = FibViewMenu;
     if(app) {
         fib_app_stop_radio(app);
-        if(app->request_mode == FibRequestModeRadioStopped) {
-            app->request_mode = FibRequestModeNormal;
-        }
+        bridge_session_cancel(app->session);
+        /* Late completion events must not reopen a tool after Back. */
+        app->request_mode = FibRequestModeNormal;
         app->pending_action = FibPendingActionNone;
         app->request_waiting_for_ready = false;
         destination = app->navigation_root == FibViewToolbox ?
@@ -1210,6 +1604,35 @@ static uint32_t fib_app_back_to_toolbox(void* context) {
 static uint32_t fib_app_back_from_status(void* context) {
     UNUSED(context);
     FibApp* app = fib_app_active;
+    if(app && app->showing_pairing_revoke) {
+        app->showing_pairing_revoke = false;
+        app->current_view = FibViewBluetoothPairings;
+        return FibViewBluetoothPairings;
+    }
+    if(app && app->showing_bluetooth_request) {
+        bridge_session_respond_bluetooth_request(app->session, app->selected_ble_request_nonce, false);
+        app->showing_bluetooth_request = false;
+        app->current_view = FibViewBluetoothRequests;
+        return FibViewBluetoothRequests;
+    }
+    if(app && app->showing_pairing) {
+        app->showing_pairing = false;
+        /* Cancel this pairing, not USB permissions or recognized computers.
+         * Restart discovery; a new code still requires explicit Pair. */
+        bridge_session_select_transport(app->session, BridgeTransportNone);
+        bridge_session_select_transport(app->session, BridgeTransportBluetooth);
+        app->current_view = FibViewMenu;
+        return FibViewMenu;
+    }
+    if(app && app->request_mode == FibRequestModeCurrency &&
+       app->pending_action != FibPendingActionCurrency) {
+        bridge_session_cancel(app->session);
+        app->pending_action = FibPendingActionNone;
+        app->request_waiting_for_ready = false;
+        toolbox_ui_currency(app->tool_cards, &app->converter, NULL);
+        app->current_view = FibViewToolCards;
+        return FibViewToolCards;
+    }
     if(app && app->request_mode == FibRequestModeMarkets &&
        app->pending_action != FibPendingActionMarkets) {
         bridge_session_cancel(app->session);
@@ -1231,6 +1654,10 @@ static uint32_t fib_app_back_from_status(void* context) {
 static uint32_t fib_app_back_from_input(void* context) {
     UNUSED(context);
     FibApp* app = fib_app_active;
+    if(app && app->request_mode == FibRequestModeCurrency) {
+        app->current_view = FibViewToolCards;
+        return FibViewToolCards;
+    }
     if(app && app->request_mode == FibRequestModeMarketSearch) {
         app->request_mode = FibRequestModeMarkets;
         app->current_view = FibViewMarkets;
@@ -1295,6 +1722,19 @@ static bool fib_app_market_validator(const char* text, FuriString* error, void* 
     return true;
 }
 
+static bool fib_app_tool_validator(const char* text, FuriString* error, void* context) {
+    FibApp* app = context;
+    if(app->request_mode == FibRequestModeCurrency) {
+        if(toolbox_valid_amount(text)) return true;
+        furi_string_set_str(error, "Use digits and up to 2 decimals");
+    } else {
+        char url[192];
+        if(toolbox_dictionary_url(text, url, sizeof(url))) return true;
+        furi_string_set_str(error, "Enter one English word (1-48)");
+    }
+    return false;
+}
+
 static void fib_app_request_or_wait(FibApp* app, const char* url) {
     if(!app || !url) return;
     if(url != app->url_buffer) {
@@ -1303,8 +1743,7 @@ static void fib_app_request_or_wait(FibApp* app, const char* url) {
 
     app->request_waiting_for_ready = false;
     const bool started = app->request_mode == FibRequestModeRadioPlaying ?
-                             bridge_session_request_radio(
-                                 app->session, app->url_buffer, FIB_DEFAULT_REQUEST_TIMEOUT_MS) :
+                             fib_app_request_radio(app) :
                              bridge_session_request_get(
                                  app->session, app->url_buffer, FIB_DEFAULT_REQUEST_TIMEOUT_MS);
     if(started) {
@@ -1329,10 +1768,12 @@ static void fib_app_open_search_input(
     app->request_mode = mode;
     app->input_buffer[0] = '\0';
     text_input_set_header_text(app->url_input, header);
-    text_input_set_minimum_length(app->url_input, 2U);
+    text_input_set_minimum_length(app->url_input,
+        mode == FibRequestModeCurrency || mode == FibRequestModeDictionary ? 1U : 2U);
     text_input_set_validator(
         app->url_input,
-        mode == FibRequestModeMarketSearch ? fib_app_market_validator : fib_app_search_validator,
+        mode == FibRequestModeMarketSearch ? fib_app_market_validator :
+        (mode == FibRequestModeCurrency || mode == FibRequestModeDictionary) ? fib_app_tool_validator : fib_app_search_validator,
         app);
     text_input_set_result_callback(
         app->url_input,
@@ -1345,10 +1786,66 @@ static void fib_app_open_search_input(
     view_dispatcher_switch_to_view(app->view_dispatcher, FibViewUrlInput);
 }
 
+static void fib_app_show_currencies(FibApp* app, bool select_to) {
+    app->currency_select_to = select_to;
+    submenu_set_header(app->currencies, select_to ? "Right Currency" : "Left Currency");
+    submenu_set_selected_item(app->currencies, app->converter.currency[select_to ? 1U : 0U]);
+    app->current_view = FibViewCurrencies;
+    /* The caller switches the view (also used by previous callbacks). */
+}
+
+static uint32_t fib_app_back_from_currencies(void* context) {
+    UNUSED(context);
+    FibApp* app = fib_app_active;
+    if(app) {
+        toolbox_ui_currency(app->tool_cards, &app->converter, NULL);
+        app->current_view = FibViewToolCards;
+    }
+    return FibViewToolCards;
+}
+
+static void fib_app_currency_selected(void* context, uint32_t index) {
+    FibApp* app = context;
+    if(!app || index >= TOOLBOX_CURRENCY_COUNT) return;
+    toolbox_converter_choose(&app->converter, app->currency_select_to ? 1U : 0U, index);
+    fib_app_fetch_currency(app);
+}
+
+static void fib_app_tool_action(void* context, ToolboxUIAction action) {
+    FibApp* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, (uint32_t)action);
+}
+
+static void fib_app_show_converter(FibApp* app, const char* note) {
+    toolbox_ui_currency(app->tool_cards, &app->converter, note);
+    app->current_view = FibViewToolCards;
+    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewToolCards);
+}
+
+static void fib_app_fetch_currency(FibApp* app) {
+    if(app->converter.rate_valid) { fib_app_show_converter(app, NULL); return; }
+    toolbox_currency_url(app->converter.currency[0], app->converter.currency[1],
+        app->url_buffer, sizeof(app->url_buffer));
+    fib_app_request_or_wait(app, app->url_buffer);
+    fib_app_show_converter(app, "Getting reference rate...");
+}
+
 static void fib_app_continue_pending_action(FibApp* app, FibPendingAction action) {
     if(!app) return;
 
     switch(action) {
+    case FibPendingActionEarthquakes:
+        app->request_mode = FibRequestModeEarthquakes;
+        fib_app_request_or_wait(app, TOOLBOX_EARTHQUAKES_URL);
+        fib_app_show_status(app, false);
+        break;
+    case FibPendingActionCurrency:
+        app->request_mode = FibRequestModeCurrency;
+        fib_app_fetch_currency(app);
+        break;
+    case FibPendingActionDictionary:
+        fib_app_open_search_input(app, FibRequestModeDictionary, "English Word", TOOLBOX_WORD_MAX + 1U);
+        break;
     case FibPendingActionMarkets:
         app->current_view = FibViewMarkets;
         view_dispatcher_switch_to_view(app->view_dispatcher, FibViewMarkets);
@@ -1433,7 +1930,15 @@ static void fib_app_start_when_ready(
 static void fib_app_url_submitted(void* context) {
     FibApp* app = context;
     if(!app) return;
-    if(app->request_mode == FibRequestModeWikipedia) {
+    if(app->request_mode == FibRequestModeDictionary) {
+        if(!toolbox_dictionary_url(app->input_buffer, app->url_buffer, sizeof(app->url_buffer))) return;
+    } else if(app->request_mode == FibRequestModeCurrency) {
+        bridge_session_cancel(app->session);
+        if(!toolbox_converter_edit(&app->converter, app->converter_input_side, app->input_buffer)) {
+            fib_app_show_converter(app, "Amount exceeds conversion limit");
+        } else fib_app_fetch_currency(app);
+        return;
+    } else if(app->request_mode == FibRequestModeWikipedia) {
         if(!fib_app_build_search_url(
                app->input_buffer, app->url_buffer, sizeof(app->url_buffer))) {
             return;
@@ -1466,7 +1971,9 @@ static void fib_app_url_submitted(void* context) {
         }
         if(!fib_app_percent_encode(country, encoded, sizeof(encoded))) return;
         const char* field = strlen(country) == 2U ? "countrycode=" : "country=";
-        snprintf(app->url_buffer, sizeof(app->url_buffer), "%s%s%s", FIB_RADIO_URL_BASE, field, encoded);
+        bridge_session_get_snapshot(app->session, &app->snapshot);
+        snprintf(app->url_buffer, sizeof(app->url_buffer), FIB_RADIO_URL_BASE "%s%s",
+            FIB_RADIO_SOURCE_MAX_KBPS, field, encoded);
         app->radio_results_shown = false;
     } else {
         snprintf(app->url_buffer, sizeof(app->url_buffer), "%s", app->input_buffer);
@@ -1479,6 +1986,7 @@ static void fib_app_weather_selected(void* context, uint32_t index) {
     FibApp* app = context;
     if(!app || index >= app->location_count) return;
     const FibWeatherLocation* location = &app->locations[index];
+    snprintf(app->input_buffer, sizeof(app->input_buffer), "%s", location->label);
     snprintf(
         app->url_buffer,
         sizeof(app->url_buffer),
@@ -1495,12 +2003,21 @@ static void fib_app_radio_selected(void* context, uint32_t index) {
     if(!app || index >= app->station_count) return;
     const FibRadioStation* station = &app->stations[index];
     snprintf(app->url_buffer, sizeof(app->url_buffer), "%s", station->url);
-    snprintf(app->search_result, sizeof(app->search_result), "%s\n%d kbps MP3",
-             station->label, station->bitrate);
+    snprintf(app->search_result, sizeof(app->search_result), "%s\n%d kbps MP3", station->label, station->bitrate);
     if(!fib_app_start_selected_radio(app)) {
         app->request_mode = FibRequestModeNormal;
-        snprintf(app->search_result, sizeof(app->search_result),
-                 "Speaker or memory is busy. Close other audio apps and try again.");
+        if(!app->snapshot.radio_pcm_supported) {
+            snprintf(app->search_result, sizeof(app->search_result),
+                "Update the desktop helper\nfor USB radio playback.");
+        } else if(memmgr_get_free_heap() < radio_player_required_heap()) {
+            snprintf(app->search_result, sizeof(app->search_result),
+                "Not enough RAM for USB radio.\nFree: %lu KB / need: %lu KB\nPlayback has not started.",
+                (unsigned long)(memmgr_get_free_heap() / 1024U),
+                (unsigned long)((radio_player_required_heap() + 1023U) / 1024U));
+        } else {
+            snprintf(app->search_result, sizeof(app->search_result),
+                "Speaker or decoder is busy. Stop other audio and try again.");
+        }
         widget_reset(app->status_widget);
         widget_add_text_scroll_element(app->status_widget, 0, 0, 128, 64, app->search_result);
         app->current_view = FibViewStatus;
@@ -1562,6 +2079,16 @@ static void fib_app_menu_selected(void* context, uint32_t index) {
         app->request_mode = FibRequestModeNormal;
         fib_app_show_status(app, true);
         break;
+    case FibMenuBluetoothRequests:
+        if(app->selected_transport == BridgeTransportBluetooth)
+            view_dispatcher_send_custom_event(app->view_dispatcher, FibCustomEventBluetoothRequests);
+        break;
+    case FibMenuBluetoothPairings:
+        if(app->selected_transport == BridgeTransportBluetooth) {
+            app->paired_host_offset = 0;
+            view_dispatcher_send_custom_event(app->view_dispatcher, FibCustomEventBluetoothPairings);
+        }
+        break;
     default:
         break;
     }
@@ -1590,15 +2117,90 @@ static void fib_app_toolbox_selected(void* context, uint32_t index) {
             app, FibPendingActionIssLocation, FibRequestModeIssLocation);
         break;
     case FibToolboxInternetRadio:
+        bridge_session_get_snapshot(app->session, &app->snapshot);
+        if(app->snapshot.bluetooth_alpha) {
+            app->request_mode = FibRequestModeRadioUnavailable;
+            app->pending_action = FibPendingActionNone;
+            fib_app_show_status(app, false);
+            break;
+        }
         fib_app_start_when_ready(
             app, FibPendingActionRadioCountryInput, FibRequestModeRadioSearch);
         break;
     case FibToolboxMarkets:
         fib_app_start_when_ready(app, FibPendingActionMarkets, FibRequestModeMarkets);
         break;
+    case FibToolboxEarthquakes:
+        fib_app_start_when_ready(app, FibPendingActionEarthquakes, FibRequestModeEarthquakes);
+        break;
+    case FibToolboxCurrency:
+        fib_app_start_when_ready(app, FibPendingActionCurrency, FibRequestModeCurrency);
+        break;
+    case FibToolboxDictionary:
+        fib_app_start_when_ready(app, FibPendingActionDictionary, FibRequestModeDictionary);
+        break;
     default:
         break;
     }
+}
+
+static uint32_t fib_app_back_to_bridge_menu(void* context) {
+    UNUSED(context);
+    if(fib_app_active) fib_app_active->current_view = FibViewMenu;
+    return FibViewMenu;
+}
+
+static void fib_app_build_mode_menu(FibApp* app) {
+    submenu_reset(app->menu);
+    submenu_set_header(app->menu, app->selected_transport == BridgeTransportUSB ?
+        "USB Internet Bridge" : "Bluetooth Bridge");
+    for(size_t i = 0; i < bridge_menu_count(app->selected_transport); ++i) {
+        const BridgeMenuEntry* entry = bridge_menu_entry(app->selected_transport, i);
+        submenu_add_item(app->menu, entry->label, entry->action, fib_app_menu_selected, app);
+    }
+    submenu_reset(app->toolbox);
+    submenu_set_header(app->toolbox, "Toolbox");
+    static const char* tools[] = {"Search Wikipedia", "Weather", "National Today",
+        "Where is the ISS?", "Internet Radio", "Markets", "Latest Earthquakes",
+        "Currency Converter", "English Dictionary"};
+    for(size_t i = 0; i < sizeof(tools) / sizeof(*tools); ++i) {
+        if(i == FibToolboxInternetRadio && !bridge_menu_has_radio(app->selected_transport)) continue;
+        submenu_add_item(app->toolbox, tools[i], i, fib_app_toolbox_selected, app);
+    }
+}
+
+static uint32_t fib_app_back_to_transport(void* context) {
+    UNUSED(context);
+    FibApp* app = fib_app_active;
+    if(!app) return VIEW_NONE;
+    fib_app_stop_radio(app);
+    radio_player_request_stop(app->radio_player);
+    bridge_session_clear_body_callback_and_wait(app->session);
+    radio_player_free(app->radio_player);
+    app->radio_player = NULL;
+    app->selected_transport = BridgeTransportNone;
+    app->pending_action = FibPendingActionNone;
+    app->request_waiting_for_ready = false;
+    app->showing_pairing = false;
+    app->showing_pairing_revoke = false;
+    app->showing_bluetooth_request = false;
+    app->request_mode = FibRequestModeNormal;
+    bridge_session_select_transport(app->session, BridgeTransportNone);
+    app->current_view = FibViewTransport;
+    app->navigation_root = FibViewMenu;
+    return FibViewTransport;
+}
+
+static void fib_app_transport_selected(void* context, uint32_t index) {
+    FibApp* app = context;
+    if(!app || (index != BridgeTransportUSB && index != BridgeTransportBluetooth)) return;
+    app->selected_transport = (BridgeTransportMode)index;
+    fib_app_build_mode_menu(app);
+    const bool started = bridge_session_select_transport(app->session, app->selected_transport);
+    app->current_view = FibViewMenu;
+    app->navigation_root = FibViewMenu;
+    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewMenu);
+    if(!started) fib_app_show_status(app, false);
 }
 
 static FibApp* fib_app_alloc(void) {
@@ -1610,15 +2212,21 @@ static FibApp* fib_app_alloc(void) {
     app->gui = furi_record_open(RECORD_GUI);
     app->view_dispatcher = view_dispatcher_alloc();
     app->menu = submenu_alloc();
+    app->transport_menu = submenu_alloc();
     app->toolbox = submenu_alloc();
     app->markets = submenu_alloc();
+    app->currencies = submenu_alloc();
+    app->bluetooth_requests = submenu_alloc();
+    app->bluetooth_pairings = submenu_alloc();
+    app->tool_cards = toolbox_ui_alloc(fib_app_tool_action, app);
+    toolbox_converter_init(&app->converter);
     app->weather_results = submenu_alloc();
     app->radio_stations = submenu_alloc();
     app->status_widget = widget_alloc();
     app->url_input = text_input_alloc();
     app->status_text = furi_string_alloc();
-    if(!app->gui || !app->view_dispatcher || !app->menu || !app->toolbox || !app->markets ||
-       !app->weather_results || !app->radio_stations || !app->status_widget ||
+    if(!app->gui || !app->view_dispatcher || !app->menu || !app->toolbox || !app->markets || !app->currencies || !app->tool_cards ||
+       !app->transport_menu || !app->bluetooth_requests || !app->bluetooth_pairings || !app->weather_results || !app->radio_stations || !app->status_widget ||
        !app->url_input || !app->status_text) {
         return app;
     }
@@ -1631,6 +2239,11 @@ static FibApp* fib_app_alloc(void) {
     submenu_set_header(app->menu, "USB Internet Bridge");
     submenu_set_header(app->toolbox, "Toolbox");
     submenu_set_header(app->markets, "Markets");
+    for(unsigned i = 0U; i < TOOLBOX_CURRENCY_COUNT; ++i) {
+        submenu_add_item(app->currencies, toolbox_currency_label(i), i, fib_app_currency_selected, app);
+    }
+    view_set_previous_callback(submenu_get_view(app->currencies), fib_app_back_from_currencies);
+    view_set_previous_callback(toolbox_ui_view(app->tool_cards), fib_app_back_to_toolbox);
     for(unsigned i = 0; i < MARKETS_COUNT; ++i) {
         submenu_add_item(app->markets, markets_name(i), i, fib_app_market_selected, app);
     }
@@ -1641,46 +2254,15 @@ static FibApp* fib_app_alloc(void) {
         fib_app_market_selected,
         app);
     view_set_previous_callback(submenu_get_view(app->markets), fib_app_back_to_toolbox);
-    submenu_add_item(
-        app->menu, "Test Connection", FibMenuTestConnection, fib_app_menu_selected, app);
-    submenu_add_item(
-        app->menu, "Get Sample Text", FibMenuDownloadSample, fib_app_menu_selected, app);
-    submenu_add_item(
-        app->menu, "Get Date and Time", FibMenuGetDateTime, fib_app_menu_selected, app);
-    submenu_add_item(app->menu, "Toolbox", FibMenuToolbox, fib_app_menu_selected, app);
-    submenu_add_item(
-        app->menu, "Custom URL Request", FibMenuCustomUrl, fib_app_menu_selected, app);
-    submenu_add_item(
-        app->menu, "Connection Info", FibMenuConnectionInfo, fib_app_menu_selected, app);
-    submenu_add_item(
-        app->toolbox,
-        "Search Wikipedia",
-        FibToolboxInformationSearch,
-        fib_app_toolbox_selected,
-        app);
-    submenu_add_item(
-        app->toolbox, "Weather", FibToolboxWeather, fib_app_toolbox_selected, app);
-    submenu_add_item(
-        app->toolbox,
-        "National Today",
-        FibToolboxNationalToday,
-        fib_app_toolbox_selected,
-        app);
-    submenu_add_item(
-        app->toolbox,
-        "Where is the ISS?",
-        FibToolboxIssLocation,
-        fib_app_toolbox_selected,
-        app);
-    submenu_add_item(
-        app->toolbox,
-        "Internet Radio",
-        FibToolboxInternetRadio,
-        fib_app_toolbox_selected,
-        app);
-    submenu_add_item(
-        app->toolbox, "Markets", FibToolboxMarkets, fib_app_toolbox_selected, app);
-    view_set_previous_callback(submenu_get_view(app->menu), fib_app_exit);
+    submenu_set_header(app->transport_menu, "Internet Bridge");
+    submenu_add_item(app->transport_menu, bridge_transport_name(BridgeTransportUSB),
+        BridgeTransportUSB, fib_app_transport_selected, app);
+    submenu_add_item(app->transport_menu, bridge_transport_name(BridgeTransportBluetooth),
+        BridgeTransportBluetooth, fib_app_transport_selected, app);
+    view_set_previous_callback(submenu_get_view(app->transport_menu), fib_app_exit);
+    view_set_previous_callback(submenu_get_view(app->bluetooth_requests), fib_app_back_to_bridge_menu);
+    view_set_previous_callback(submenu_get_view(app->bluetooth_pairings), fib_app_back_to_bridge_menu);
+    view_set_previous_callback(submenu_get_view(app->menu), fib_app_back_to_transport);
     view_set_previous_callback(submenu_get_view(app->toolbox), fib_app_back_to_menu);
     view_set_previous_callback(submenu_get_view(app->weather_results), fib_app_back_to_toolbox);
     view_set_previous_callback(submenu_get_view(app->radio_stations), fib_app_back_to_toolbox);
@@ -1701,9 +2283,14 @@ static FibApp* fib_app_alloc(void) {
     view_set_previous_callback(text_input_get_view(app->url_input), fib_app_back_from_input);
 
     view_dispatcher_add_view(app->view_dispatcher, FibViewMenu, submenu_get_view(app->menu));
+    view_dispatcher_add_view(app->view_dispatcher, FibViewTransport, submenu_get_view(app->transport_menu));
+    view_dispatcher_add_view(app->view_dispatcher, FibViewBluetoothRequests, submenu_get_view(app->bluetooth_requests));
+    view_dispatcher_add_view(app->view_dispatcher, FibViewBluetoothPairings, submenu_get_view(app->bluetooth_pairings));
     view_dispatcher_add_view(
         app->view_dispatcher, FibViewToolbox, submenu_get_view(app->toolbox));
     view_dispatcher_add_view(app->view_dispatcher, FibViewMarkets, submenu_get_view(app->markets));
+    view_dispatcher_add_view(app->view_dispatcher, FibViewCurrencies, submenu_get_view(app->currencies));
+    view_dispatcher_add_view(app->view_dispatcher, FibViewToolCards, toolbox_ui_view(app->tool_cards));
     view_dispatcher_add_view(
         app->view_dispatcher, FibViewStatus, widget_get_view(app->status_widget));
     view_dispatcher_add_view(
@@ -1716,31 +2303,35 @@ static FibApp* fib_app_alloc(void) {
 
     app->session = bridge_session_alloc(fib_app_session_updated, app);
     if(!app->session) return app;
-    app->radio_player = radio_player_alloc();
-    if(!app->radio_player) return app;
-    bridge_session_start(app->session);
-    app->current_view = FibViewMenu;
+    /* No bridge transport, discovery or internet consent before mode selection. */
+    app->current_view = FibViewTransport;
     app->navigation_root = FibViewMenu;
     return app;
 }
 
 static bool fib_app_is_complete(const FibApp* app) {
-    return app && app->gui && app->view_dispatcher && app->menu && app->toolbox && app->markets &&
-           app->status_widget && app->weather_results && app->radio_stations && app->url_input &&
-           app->status_text && app->session && app->radio_player;
+    return app && app->gui && app->view_dispatcher && app->menu && app->toolbox && app->markets && app->currencies && app->tool_cards &&
+           app->transport_menu && app->bluetooth_requests && app->bluetooth_pairings && app->status_widget && app->weather_results && app->radio_stations && app->url_input &&
+           app->status_text && app->session;
 }
 
 static void fib_app_free(FibApp* app) {
     if(!app) return;
     if(fib_app_active == app) fib_app_active = NULL;
-    if(app->session) bridge_session_set_body_callback(app->session, NULL, NULL);
+    radio_player_request_stop(app->radio_player);
+    if(app->session) bridge_session_clear_body_callback_and_wait(app->session);
     if(app->radio_player) radio_player_free(app->radio_player);
     if(app->session) bridge_session_free(app->session);
     if(app->view_dispatcher) {
         if(app->views_added) {
             view_dispatcher_remove_view(app->view_dispatcher, FibViewMenu);
+            view_dispatcher_remove_view(app->view_dispatcher, FibViewTransport);
+            view_dispatcher_remove_view(app->view_dispatcher, FibViewBluetoothRequests);
+            view_dispatcher_remove_view(app->view_dispatcher, FibViewBluetoothPairings);
             view_dispatcher_remove_view(app->view_dispatcher, FibViewToolbox);
             view_dispatcher_remove_view(app->view_dispatcher, FibViewMarkets);
+            view_dispatcher_remove_view(app->view_dispatcher, FibViewCurrencies);
+            view_dispatcher_remove_view(app->view_dispatcher, FibViewToolCards);
             view_dispatcher_remove_view(app->view_dispatcher, FibViewStatus);
             view_dispatcher_remove_view(app->view_dispatcher, FibViewUrlInput);
             view_dispatcher_remove_view(app->view_dispatcher, FibViewWeatherResults);
@@ -1753,8 +2344,13 @@ static void fib_app_free(FibApp* app) {
     if(app->radio_stations) submenu_free(app->radio_stations);
     if(app->status_widget) widget_free(app->status_widget);
     if(app->menu) submenu_free(app->menu);
+    if(app->transport_menu) submenu_free(app->transport_menu);
+    if(app->bluetooth_requests) submenu_free(app->bluetooth_requests);
+    if(app->bluetooth_pairings) submenu_free(app->bluetooth_pairings);
     if(app->toolbox) submenu_free(app->toolbox);
     if(app->markets) submenu_free(app->markets);
+    if(app->currencies) submenu_free(app->currencies);
+    if(app->tool_cards) toolbox_ui_free(app->tool_cards);
     if(app->status_text) furi_string_free(app->status_text);
     if(app->gui) furi_record_close(RECORD_GUI);
     free(app);
@@ -1769,7 +2365,7 @@ int32_t usb_internet_bridge_main(void* context) {
         return -1;
     }
 
-    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewMenu);
+    view_dispatcher_switch_to_view(app->view_dispatcher, FibViewTransport);
     view_dispatcher_run(app->view_dispatcher);
     fib_app_free(app);
     return 0;

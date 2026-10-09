@@ -27,11 +27,31 @@ final class NationalTodayExtractorTests: XCTestCase {
         let data = try XCTUnwrap(NationalTodayExtractor.extract(from: Data(html.utf8)))
         XCTAssertEqual(
             String(decoding: data, as: UTF8.self),
-            "[[B]]Example Day[[/B]]celebrates testing & safety - it's useful."
+            "[[B]]Example Day[[/B]] celebrates testing & safety - it's useful."
         )
     }
 
     func testRejectsPageWithoutDailyParagraph() {
         XCTAssertNil(NationalTodayExtractor.extract(from: Data("<html></html>".utf8)))
+    }
+    func testPreservesBoldMarkersAndTransliteratesAccentsForFlipperFonts() throws {
+        let html = "<div class=\"single-date-header-content\"><p><b>Café Day</b> celebrates Muğla — today.</p></div>"
+        let data = try XCTUnwrap(NationalTodayExtractor.extract(from: Data(html.utf8)))
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "[[B]]Cafe Day[[/B]] celebrates Mugla - today.")
+        XCTAssertTrue(data.allSatisfy { (32...126).contains($0) })
+    }
+
+    func testPreservesSpacesAndAttributedBoldTags() throws {
+        let html = "<div class=\"single-date-header-content\"><p><b>First Day</b> is here. <strong class=\"day\">Next Day</strong> uses pre<b>fix</b>es.</p></div>"
+        let data = try XCTUnwrap(NationalTodayExtractor.extract(from: Data(html.utf8)))
+        XCTAssertEqual(String(decoding: data, as: UTF8.self),
+                       "[[B]]First Day[[/B]] is here. [[B]]Next Day[[/B]] uses pre[[B]]fix[[/B]]es.")
+    }
+
+    func testRejectsMarkerOnlyParagraphs() {
+        for fragment in ["<b></b>", "<strong> </strong>"] {
+            let html = "<div class=\"single-date-header-content\"><p>\(fragment)</p></div>"
+            XCTAssertNil(NationalTodayExtractor.extract(from: Data(html.utf8)))
+        }
     }
 }

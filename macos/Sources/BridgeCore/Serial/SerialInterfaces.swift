@@ -1,5 +1,7 @@
 import Foundation
 
+public enum BridgeLinkKind: String, Sendable { case usb, bluetoothAlpha }
+
 public struct SerialDevice: Equatable, Sendable {
     public let registryID: UInt64
     public let calloutPath: String
@@ -8,6 +10,7 @@ public struct SerialDevice: Equatable, Sendable {
     public let interfaceNumber: Int?
     public let usbSerialNumber: String?
     public let productName: String?
+    public let linkKind: BridgeLinkKind
 
     public init(
         registryID: UInt64,
@@ -16,7 +19,8 @@ public struct SerialDevice: Equatable, Sendable {
         productID: UInt16? = nil,
         interfaceNumber: Int? = nil,
         usbSerialNumber: String? = nil,
-        productName: String? = nil
+        productName: String? = nil,
+        linkKind: BridgeLinkKind = .usb
     ) {
         self.registryID = registryID
         self.calloutPath = calloutPath
@@ -25,6 +29,7 @@ public struct SerialDevice: Equatable, Sendable {
         self.interfaceNumber = interfaceNumber
         self.usbSerialNumber = usbSerialNumber
         self.productName = productName
+        self.linkKind = linkKind
     }
 }
 

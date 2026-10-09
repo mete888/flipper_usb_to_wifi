@@ -131,6 +131,11 @@ RadioAudio* radio_audio_alloc(void) {
     return calloc(1, sizeof(RadioAudio));
 }
 
+size_t radio_audio_required_heap(void) { return sizeof(RadioAudio) + 64U; }
+size_t radio_audio_buffered_bytes(const RadioAudio* audio) {
+    return audio ? radio_audio_available(audio) * sizeof(int16_t) : 0U;
+}
+
 void radio_audio_stop(RadioAudio* audio) {
     if(!audio || !audio->running) return;
     audio->running = false;
